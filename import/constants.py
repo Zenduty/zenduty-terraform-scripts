@@ -21,4 +21,5 @@ terraform_map = {
     "team": 'zenduty_teams.{}.id',
     "ep": "zenduty_esp.{}.id",
     "schedule": 'zenduty_schedules.{}.id',
+    "user": "zenduty_user.{}.id",
 }

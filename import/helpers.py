@@ -57,6 +57,8 @@ def write_into_file(name, file, resource, parameters):
                 if "id" in st:
                     output.pop(j)
                     j += 1
+    elif file == 'users':
+        output.pop(4)
     else:
         output.pop(2)
     output = "\n".join(output)
@@ -101,7 +103,22 @@ def find_replace(file, word, instance, datafile):
                             text=terraform_map['schedule'].format(datafile[word]),
                             name=data[0],
                         )
-
+                    else:
+                        line = instance.render(
+                            text=terraform_map['user'].format(datafile[word]),
+                            name=data[0],
+                        )
+                elif "user" in data[0]:
+                    line = instance.render(
+                        text=terraform_map['user'].format(datafile[word]),
+                        name=data[0],
+                    )
+                # else:
+                #     from automate import TEMPLATE_ENVIRONMENT
+                #     instance = TEMPLATE_ENVIRONMENT.get_template("userreplace.jinja2")
+                #     line = instance.render(
+                #         text=terraform_map['user'].format(datafile[word]),
+                #     )
                 f.write(line)
                 f.write("\n")
             else:
@@ -110,7 +127,7 @@ def find_replace(file, word, instance, datafile):
 
 
 def check_name(name, file):
-    name = name.replace(" ", "")
+    name = name.replace(" ", "").replace("-", "").replace(".", "")
     if check_string(file, name):
         return f"{name}{str(uuid.uuid4())[:4]}"
     return name

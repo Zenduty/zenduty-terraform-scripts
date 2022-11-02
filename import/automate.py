@@ -1,7 +1,7 @@
 import time
 from jinja2 import Environment, FileSystemLoader
 import json
-from constants import ZENDUTY_TEAMS, zendutyrequest, ZENDUTY_SCHEDULES, ZENDUTY_ESP, ZENDUTY_SERVICE
+from constants import ZENDUTY_TEAMS, zendutyrequest, ZENDUTY_SCHEDULES, ZENDUTY_ESP, ZENDUTY_SERVICE, ZENDUTY_USERS
 from helpers import overide_into_file, write_into_file, check_name, create_mapping, find_replace
 TEMPLATE_ENVIRONMENT = Environment(loader=FileSystemLoader('templates'))
 
@@ -59,17 +59,28 @@ def import_service():
                             f"{team['unique_id']}/{service['unique_id']}")
 
 
+def import_user():
+    user_instance = TEMPLATE_ENVIRONMENT.get_template("common.jinja2")
+    res = zendutyrequest.get(ZENDUTY_USERS)
+    for user in res.json():
+        user = user['user']
+        time.sleep(1)
+        name = check_name(f"{user['first_name']}{user['last_name']}", 'users.tf')
+        overide_into_file(name, user_instance, 'zenduty_user')
+        write_into_file(name, 'users', 'zenduty_user', f"{user['username']}")
+        create_mapping(user['username'], name)
+
+
 def replace():
     with open('mapping.json') as temp_f:
         datafile = json.loads(temp_f.read())
     instance = TEMPLATE_ENVIRONMENT.get_template("replace.jinja2")
     for obj in datafile:
-        find_replace('services.tf', obj, instance, datafile)
+        find_replace('escalations.tf', obj, instance, datafile)
 
 
+# replace()
 # import_team()
 # replace()
 # import_ep()
 # import_service()
-
-# replace()

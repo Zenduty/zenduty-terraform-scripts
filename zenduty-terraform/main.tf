@@ -26,6 +26,7 @@ data "zenduty_user" "user2" {
   email = "demouser2@gmail.com"
 }
 
+
 # creating team 
 resource "zenduty_teams" "infrateam" {
   name = "Infra Team"
@@ -35,6 +36,15 @@ resource "zenduty_teams" "infrateam" {
 resource "zenduty_member" "demouser2" {
    team = zenduty_teams.infrateam.id
    user = data.zenduty_user.user2.users[0].username
+}
+
+# invite user to team
+
+resource "zenduty_user" "user3" {
+  email      = "michael@scott.com"
+  first_name = "Michael"
+  last_name  = "Scott"
+  team       =  zenduty_teams.infrateam.id
 }
 
 # schedule 
@@ -48,7 +58,7 @@ resource "zenduty_schedules" "infraschedule" {
     rotation_end_time = "2026-03-01 11:36"
     rotation_start_time = "2022-03-01 11:36"
     shift_length = 86400
-    users = [data.zenduty_user.user1.users[0].username]
+    users = [zenduty_user.user3.id]
   }
 }
 
@@ -63,7 +73,7 @@ resource "zenduty_esp" "primaryep" {
         delay = 0    
         targets {
             target_type = 2
-            target_id = data.zenduty_user.user1.users[0].username  //username of user
+            target_id = zenduty_user.user3.id  //username of user
         }
         targets {
             target_type = 1
