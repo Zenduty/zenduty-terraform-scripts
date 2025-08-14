@@ -1,0 +1,11 @@
+certifi==2024.7.4
+charset-normalizer==3.3.2
+idna==3.7
+Jinja2==3.1.6
+lark==1.2.2
+MarkupSafe==3.0.2
+regex==2024.11.6
+requests==2.32.3
+six==1.9.0
+urllib3==2.2.2
+zenduty-api==1.0.0

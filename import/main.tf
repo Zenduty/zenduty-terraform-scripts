@@ -1,3 +1,4 @@
+# Configure the zenduty provider
 terraform {
   required_providers {
     zenduty = {
