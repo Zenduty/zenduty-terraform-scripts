@@ -10,7 +10,7 @@ import json
 
 subprocess.run("terraform init", shell=True)
 # export ZENDUTY_API_KEY
-cred = ZendutyCredential("")
+cred = ZendutyCredential()
 client = ZendutyClient(credential=cred, use_https=True)
 
 TEMPLATE_ENVIRONMENT = Environment(loader=FileSystemLoader("templates"))
