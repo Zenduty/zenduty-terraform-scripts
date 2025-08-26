@@ -118,7 +118,7 @@ def parse_write_into_file(output, file, unique_id, name, line_assert=False):
         # Remove ANSI escape codes for matching
         clean_line = re.sub(r"\x1b\[[0-9;]*m", "", line)
         # Skip lines containing sensitive or generated fields
-        if re.search(r"\b(id|integration_key|webhook_url|unique_id)\s*=", clean_line):
+        if re.search(r"\b(id|integration_key|webhook_url|unique_id|position)\s*=", clean_line):
             if line_assert:
                 # Only skip in the first 3 processed lines
                 if line_index < 4:
