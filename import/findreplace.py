@@ -1,6 +1,10 @@
 import json
 import os
 import re
+import sys
+
+# Must match the folder automate.py exported into
+OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ZENDUTY_EXPORT_DIR", "export")
 
 
 def direct_replace_ids(file_path: str, mapping_path: str) -> None:
@@ -37,8 +41,18 @@ files = [
     "zenduty_sla.tf",
     "zenduty_teams.tf",
     "zenduty_roles.tf",
-    "zenduty_alertrules.tf",
+    "zenduty_member.tf",
+    "zenduty_maintenance_window.tf",
+    "zenduty_post_incident_tasks.tf",
+    "zenduty_task_templates.tf",
+    "zenduty_task_template_tasks.tf",
+    "zenduty_team_permissions.tf",
+    "zenduty_outgoing_rules.tf",
+    "zenduty_notification_rules.tf",
+    "zenduty_account_role.tf",
+    "zenduty_globalrouter.tf",
+    "zenduty_globalrouting_rule.tf",
 ]
 
 for file in files:
-    direct_replace_ids(file, "mapping.json")
+    direct_replace_ids(os.path.join(OUTPUT_DIR, file), os.path.join(OUTPUT_DIR, "mapping.json"))
