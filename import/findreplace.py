@@ -31,6 +31,7 @@ def direct_replace_ids(file_path: str, mapping_path: str) -> None:
 
 
 files = [
+    "zenduty_user.tf",
     "zenduty_schedules.tf",
     "zenduty_esp.tf",
     "zenduty_priorities.tf",
@@ -49,6 +50,7 @@ files = [
     "zenduty_team_permissions.tf",
     "zenduty_outgoing_rules.tf",
     "zenduty_notification_rules.tf",
+    "zenduty_usercontact.tf",
     "zenduty_account_role.tf",
     "zenduty_globalrouter.tf",
     "zenduty_globalrouting_rule.tf",
