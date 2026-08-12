@@ -3,18 +3,53 @@ from zenduty.apiV2.authentication.zenduty_credential import ZendutyCredential
 from zenduty.apiV2.client import ZendutyClient, ZendutyClientRequestMethod
 from zenduty.apiV2.teams import TeamsClient
 import os
+import random
 import shutil
 import sys
+import threading
+import time
 import uuid
 import subprocess
 import re
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
+import requests
+from zenduty.apiV2.client import APIException
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _terraform_supports_import_blocks():
+    try:
+        run = subprocess.run(["terraform", "version", "-json"], capture_output=True, text=True)
+        version = json.loads(run.stdout)["terraform_version"]
+        major, minor = (int(x) for x in version.split(".")[:2])
+        return (major, minor) >= (1, 5)
+    except Exception:
+        return False
+
+
+# Fast mode enumerates everything via the API first (threaded), then imports
+# all resources in one `terraform plan -generate-config-out` (parallel provider
+# reads, single state write) instead of ~2 terraform subprocesses per resource.
+# It is the default whenever terraform >= 1.5 (import blocks); --slow or
+# ZENDUTY_FAST_IMPORT=0 forces the old per-resource path, --fast or
+# ZENDUTY_FAST_IMPORT=1 demands fast mode. Best used on a fresh export folder.
+if "--slow" in sys.argv[1:] or os.environ.get("ZENDUTY_FAST_IMPORT") == "0":
+    FAST_MODE = False
+elif "--fast" in sys.argv[1:] or os.environ.get("ZENDUTY_FAST_IMPORT") == "1":
+    if not _terraform_supports_import_blocks():
+        sys.exit("--fast needs terraform >= 1.5 for import blocks")
+    FAST_MODE = True
+else:
+    FAST_MODE = _terraform_supports_import_blocks()
+print(f"import mode: {'fast (import blocks)' if FAST_MODE else 'per-resource terraform import'}")
+_args = [a for a in sys.argv[1:] if a not in ("--fast", "--slow")]
 # Everything (generated .tf files, terraform state, mapping.json) is written here,
 # making the folder a self-contained terraform workspace
-OUTPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ZENDUTY_EXPORT_DIR", "export")
+OUTPUT_DIR = _args[0] if _args else os.environ.get("ZENDUTY_EXPORT_DIR", "export")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -30,10 +65,96 @@ if not os.path.exists(out("main.tf")):
 if os.path.exists(out("temp1.tf")):
     os.remove(out("temp1.tf"))
 
+# a leftover imports.tf means a fast run aborted after writing config but
+# before committing state + mapping.json; re-running on top would duplicate
+# every resource under suffixed names
+if FAST_MODE and os.path.exists(out("imports.tf")):
+    sys.exit(
+        f"{out('imports.tf')} is left over from an aborted fast run;"
+        " start again with a fresh export folder"
+    )
+
 subprocess.run("terraform init", shell=True, cwd=OUTPUT_DIR)
 # export ZENDUTY_API_KEY
 cred = ZendutyCredential()
 client = ZendutyClient(credential=cred, use_https=True)
+
+
+class AdaptiveThrottle:
+    """AIMD rate governor shared by every enumeration thread.
+
+    Threads draw request slots from one budget, so the worker count no longer
+    determines the request rate. A 429 halves the rate and pushes the next
+    slot out for everyone; sustained success raises the rate additively, so
+    throughput converges on whatever the API actually allows.
+    """
+
+    def __init__(self, initial_rps, min_rps=0.5, max_rps=50.0):
+        self.rate = initial_rps
+        self.min_rate = min_rps
+        self.max_rate = max_rps
+        self.lock = threading.Lock()
+        self.next_slot = time.monotonic()
+        self.successes = 0
+
+    def acquire(self):
+        with self.lock:
+            now = time.monotonic()
+            wait = self.next_slot - now
+            self.next_slot = max(self.next_slot, now) + 1.0 / self.rate
+        if wait > 0:
+            time.sleep(wait)
+
+    def on_success(self):
+        with self.lock:
+            self.successes += 1
+            if self.successes >= 20:
+                self.successes = 0
+                self.rate = min(self.rate + 1.0, self.max_rate)
+
+    def on_rate_limited(self, penalty):
+        with self.lock:
+            self.successes = 0
+            self.rate = max(self.rate / 2.0, self.min_rate)
+            # push the shared next slot out so every thread backs off together,
+            # not just the one that saw the 429
+            self.next_slot = max(self.next_slot, time.monotonic() + penalty)
+            return self.rate
+
+
+# every SDK call funnels through client.execute, so pacing and retries live at
+# that single point; ZENDUTY_API_RPS sets the starting request rate
+_throttle = AdaptiveThrottle(initial_rps=float(os.environ.get("ZENDUTY_API_RPS", "8")))
+_original_execute = client.execute
+
+
+def _execute_with_retry(*args, **kwargs):
+    delay = 2.0
+    last_error = None
+    for attempt in range(8):
+        _throttle.acquire()
+        try:
+            result = _original_execute(*args, **kwargs)
+        except (APIException, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_error = e
+            code = getattr(e, "_code", None)
+            if code == 429:
+                new_rate = _throttle.on_rate_limited(penalty=2.0 * (attempt + 1) + random.uniform(0, 1))
+                print(f"WARN: rate limited; slowing shared request rate to {new_rate:.1f}/s")
+                continue
+            if code in (502, 503, 504) or not isinstance(e, APIException):
+                wait = delay + random.uniform(0, delay / 2)
+                print(f"WARN: API request failed ({code or type(e).__name__}); retrying in {wait:.1f}s")
+                time.sleep(wait)
+                delay = min(delay * 2, 60)
+                continue
+            raise
+        _throttle.on_success()
+        return result
+    raise last_error
+
+
+client.execute = _execute_with_retry
 
 TEMPLATE_ENVIRONMENT = Environment(loader=FileSystemLoader(os.path.join(SCRIPT_DIR, "templates")))
 
@@ -60,12 +181,55 @@ def load_mapping_file(path=None):
 load_mapping_file()
 
 
+# fast mode queues every resource here during enumeration and imports them all
+# at the end; config for data sources is buffered so nothing lands on disk
+# unless the terraform phase commits. Enumeration runs threaded in fast mode
+# (the SDK issues a stateless request per call), so all shared bookkeeping is
+# guarded by one reentrant lock.
+fast_worklist = []
+config_buffers = {}
+planned_names = {}
+state_lock = threading.RLock()
+
+
+def run_parallel(items, fn, what):
+    # normal mode must stay sequential: concurrent `terraform import` runs
+    # fight over the state lock
+    if not FAST_MODE:
+        for item in items:
+            fn(item)
+        return
+    # worker count no longer determines the request rate — the shared
+    # AdaptiveThrottle paces actual requests, so threads just provide
+    # concurrency for whatever rate the API sustains
+    env_workers = os.environ.get("ZENDUTY_ENUM_THREADS")
+    workers = int(env_workers) if env_workers else min(32, (os.cpu_count() or 4) + 4)
+    workers = max(1, min(workers, len(items)))
+    print(f"enumerating {len(items)} {what} with {workers} threads")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fn, item) for item in items]
+        for future in as_completed(futures):
+            future.result()
+
+
 def add_mapping(unique_id, resource_name, flush=True):
     if not unique_id or not resource_name:
         return
-    create_mapping[str(unique_id)] = resource_name
-    if flush:
-        write_mapping_file()
+    with state_lock:
+        create_mapping[str(unique_id)] = resource_name
+        # in fast mode the mapping is only persisted after the import succeeds, so
+        # an aborted run doesn't leave entries for resources that never landed
+        if flush and not FAST_MODE:
+            write_mapping_file()
+
+
+def append_config(file, text):
+    with state_lock:
+        if FAST_MODE:
+            config_buffers.setdefault(file, []).append(text)
+            return
+        with open(out(file), "a", encoding="utf-8") as f:
+            f.write(text)
 
 
 def write_mapping_file(path=None):
@@ -115,10 +279,18 @@ def check_name(name: str, file: str) -> str:
     # Ensure it doesn't start with a digit
     if re.match(r"^\d", name):
         name = f"_{name}"
-    # Append suffix if name already exists
-    if check_string(out(file), name):
-        name = f"{name}_{str(uuid.uuid4())[:4]}"
-    return name
+    with state_lock:
+        # Suffix until the name is actually free (in the file, or planned for it
+        # in fast mode where nothing is written until the end). The suffix must
+        # be re-checked too: with hundreds of identically-named resources a
+        # random 4-hex suffix collides far sooner than 65536 names (birthday
+        # paradox), which surfaced as duplicate import blocks.
+        planned = planned_names.setdefault(file, set())
+        candidate = name
+        while check_string(out(file), candidate) or candidate in planned:
+            candidate = f"{name}_{str(uuid.uuid4())[:4]}"
+        planned.add(candidate)
+    return candidate
 
 
 def execute_terraform_import(name, resource, parameters, unique_id):
@@ -176,6 +348,33 @@ def parse_write_into_file(output, file, unique_id, name, line_assert=False, extr
 
 common_template = TEMPLATE_ENVIRONMENT.get_template("common.jinja2")
 
+# mirrors the provider's action validation (resource_alertrules.go): these
+# action types carry their payload in a dedicated field, 3/18 take none, 11
+# needs `key`, everything else needs `value`. An action whose target object
+# was deleted survives in the source DB with a null payload and can never be
+# re-created.
+ALERT_ACTION_TYPE_ATTR = {
+    4: "escalation_policy",
+    5: "schedule",
+    6: "assign_to",
+    14: "sla",
+    15: "team_priority",
+    16: "task_template",
+}
+
+
+def creatable_alert_actions(actions):
+    creatable = 0
+    for action in actions:
+        action_type = action.get("action_type")
+        if action_type in (3, 18):
+            creatable += 1
+        elif action_type == 11:
+            creatable += bool(action.get("key"))
+        elif action.get("value") or action.get(ALERT_ACTION_TYPE_ATTR.get(action_type, "value")):
+            creatable += 1
+    return creatable
+
 
 def safe_get(endpoint, raw=False):
     # Some endpoints 404/403 depending on the account plan; skip them instead of aborting the run
@@ -215,6 +414,29 @@ def import_and_write(
     display_name, resource, import_id, unique_id, line_assert=False, extra_lines=None, extra_skip=None
 ):
     name = check_name(display_name, f"{resource}.tf")
+
+    if FAST_MODE:
+        with state_lock:
+            if str(unique_id) in create_mapping:
+                print(f"{resource}.{name} ({unique_id}) already imported")
+                return name
+            fast_worklist.append(
+                {
+                    "resource": resource,
+                    "name": name,
+                    "import_id": import_id,
+                    "unique_id": str(unique_id),
+                    "line_assert": line_assert,
+                    "extra_lines": extra_lines,
+                    "extra_skip": extra_skip,
+                }
+            )
+            # in-memory only (see add_mapping): downstream references like the
+            # member depends_on derivation need the entry during enumeration
+            add_mapping(unique_id, f"{resource}.{name}.id")
+        print(f"queued {resource}.{name}")
+        return name
+
     write_into_temp_file(name, common_template, resource)
     output = execute_terraform_import(name, resource, import_id, unique_id)
     parse_write_into_file(
@@ -243,7 +465,8 @@ if default_team is None:
 
 all_users = client.execute(ZendutyClientRequestMethod.GET, "/api/account/users/")
 
-for user in all_users:
+
+def process_user(user):
     username = user["user"]["username"]
 
     # role 1 is the account owner, which the provider cannot manage (the API
@@ -251,19 +474,21 @@ for user in all_users:
     # resources can still reference the owner
     if str(user["role"]) == "1":
         owner_email = user["user"].get("email")
-        if owner_email and username not in create_mapping:
-            name = check_name(user["user"]["first_name"] + user["user"]["last_name"], "zenduty_user.tf")
-            with open(out("zenduty_user.tf"), "a") as f:
-                f.write(f'data "zenduty_user" "{name}" {{\n    email = "{owner_email}"\n}}\n')
-            add_mapping(username, f"data.zenduty_user.{name}.users[0].username")
-        continue
+        with state_lock:
+            if owner_email and username not in create_mapping:
+                name = check_name(user["user"]["first_name"] + user["user"]["last_name"], "zenduty_user.tf")
+                append_config(
+                    "zenduty_user.tf", f'data "zenduty_user" "{name}" {{\n    email = "{owner_email}"\n}}\n'
+                )
+                add_mapping(username, f"data.zenduty_user.{name}.users[0].username")
+        return
 
     # bot/integration users have no email; the provider cannot create or manage them
     if not user["user"].get("email"):
         print(f"skipping bot user {user['user'].get('first_name', '')} {user['user'].get('last_name', '')}")
-        continue
+        return
 
-    name = import_and_write(
+    import_and_write(
         user["user"]["first_name"] + user["user"]["last_name"],
         "zenduty_user",
         username,
@@ -271,39 +496,14 @@ for user in all_users:
         extra_lines=[f'    team       = "{default_team}"'] if default_team else None,
     )
 
-    # contact method UUIDs are per-user, per-instance personal data; map each
-    # referenced contact to a data source lookup by (user, contact_type) so the
-    # config resolves the target instance's own contact ids at apply time
-    contact_types = {}
-    for contact in safe_get(f"/api/account/users/{username}/contacts/"):
-        contact_types[str(contact["unique_id"])] = contact["contact_type"]
+    # notification rules are deliberately not migrated: they are personal
+    # per-user preferences tied to contact methods (phone/email UUIDs) that
+    # only exist once the user completes signup on the target, and the invite
+    # already creates a sensible default set there. The usercontact data-source
+    # lookups existed only to serve them, so they are gone too.
 
-    for notification_rule in safe_get(f"/api/account/users/{username}/notification_rules/"):
-        contact_id = str(notification_rule.get("contact") or "")
-        if contact_id and contact_id not in create_mapping:
-            contact_type = contact_types.get(contact_id)
-            if contact_type is None:
-                print(
-                    f"WARN: notification rule {notification_rule['unique_id']} references"
-                    f" unknown contact {contact_id}; leaving the raw id in place"
-                )
-            else:
-                contact_name = check_name(f"{name}_contact_{contact_type}", "zenduty_usercontact.tf")
-                with open(out("zenduty_usercontact.tf"), "a") as f:
-                    f.write(
-                        f'data "zenduty_usercontact" "{contact_name}" {{\n'
-                        f'    user_id      = "{username}"\n'
-                        f"    contact_type = {contact_type}\n"
-                        f"}}\n"
-                    )
-                add_mapping(contact_id, f"data.zenduty_usercontact.{contact_name}.id")
 
-        import_and_write(
-            f"{name}_notification",
-            "zenduty_notification_rules",
-            f"{username}/{notification_rule['unique_id']}",
-            notification_rule["unique_id"],
-        )
+run_parallel(all_users, process_user, "users")
 
 for account_role in safe_get("/api/account/customroles/"):
     import_and_write(
@@ -313,7 +513,8 @@ for account_role in safe_get("/api/account/customroles/"):
         account_role["unique_id"],
     )
 
-for team in all_teams:
+
+def process_team(team):
     # the team itself goes first so an interrupted run still has the resources
     # everything else references
     import_and_write(team.name, "zenduty_teams", team.unique_id, team.unique_id, extra_skip=("owner",))
@@ -357,14 +558,21 @@ for team in all_teams:
         )
 
     for escalation in teams_client.get_escalation_policy_client(team).get_all_policies():
-        # the create API refuses EPs with no rules, so an exported one could
-        # never be applied to a fresh account; skip it (and anything that
-        # references it will surface the dangling id at plan time)
-        if not getattr(escalation, "rules", None):
+        # the create API refuses EPs with no rules — and treats rules without
+        # targets the same way — so an exported one could never be applied to
+        # a fresh account; skip it (and anything that references it will
+        # surface the dangling id at plan time). EPs that keep at least one
+        # targeted rule are exported as-is; apply.py strips their remaining
+        # target-less rules before applying.
+        rules = getattr(escalation, "rules", None) or []
+        if not any(
+            (rule.get("targets") if isinstance(rule, dict) else getattr(rule, "targets", None))
+            for rule in rules
+        ):
             print(
                 f"WARN: skipping escalation policy '{escalation.name}' ({escalation.unique_id}):"
-                " it has no rules, which the create API rejects; add a rule in the"
-                " source account to include it"
+                " it has no rules with targets, which the create API rejects; add a"
+                " targeted rule in the source account to include it"
             )
             continue
         import_and_write(
@@ -418,15 +626,18 @@ for team in all_teams:
             app_ref = integration.application_reference
             app_name = app_ref["name"] if isinstance(app_ref, dict) else getattr(app_ref, "name", None)
             app_uuid = str(integration.application or "")
-            if app_uuid and app_name and app_uuid not in create_mapping:
-                data_name = check_name(app_name, "zenduty_applications.tf")
-                with open(out("zenduty_applications.tf"), "a") as f:
-                    f.write(
+            # under the lock: the same application shows up in many teams, and
+            # two threads must not both pass the dedupe check
+            with state_lock:
+                if app_uuid and app_name and app_uuid not in create_mapping:
+                    data_name = check_name(app_name, "zenduty_applications.tf")
+                    append_config(
+                        "zenduty_applications.tf",
                         f'data "zenduty_applications" "{data_name}" {{\n'
                         f"    name = {json.dumps(app_name)}\n"
-                        f"}}\n"
+                        f"}}\n",
                     )
-                add_mapping(app_uuid, f"data.zenduty_applications.{data_name}.id")
+                    add_mapping(app_uuid, f"data.zenduty_applications.{data_name}.id")
 
             import_and_write(
                 integration.name,
@@ -438,6 +649,18 @@ for team in all_teams:
             for alert_rule in safe_get(
                 f"/api/account/teams/{team.unique_id}/services/{service.unique_id}/integrations/{integration.unique_id}/transformers/"  # noqa
             ):
+                # the create API rejects alert rules without actions, so a rule
+                # with none left (all targets deleted on the source) could never
+                # be applied to a fresh account; skip it. Rules that keep at
+                # least one creatable action are exported as-is; apply.py strips
+                # their broken actions before applying.
+                if not creatable_alert_actions(alert_rule.get("actions") or []):
+                    print(
+                        f"WARN: skipping alert rule '{alert_rule['description']}'"
+                        f" ({alert_rule['unique_id']}): none of its actions are creatable"
+                        " (payload objects deleted on the source), which the create API rejects"
+                    )
+                    continue
                 import_and_write(
                     alert_rule["description"],
                     "zenduty_alertrules",
@@ -502,6 +725,9 @@ for team in all_teams:
             f"permissions-{team.unique_id}",
         )
 
+
+run_parallel(all_teams, process_team, "teams")
+
 for router in safe_get("/api/v2/account/events/router/"):
     import_and_write(
         router["name"],
@@ -510,12 +736,246 @@ for router in safe_get("/api/v2/account/events/router/"):
         router["unique_id"],
     )
     for routing_rule in safe_get(f"/api/v2/account/events/router/{router['unique_id']}/rulesets/"):
+        # the create API rejects routing rules with no actions, so an exported
+        # one could never be applied to a fresh account; skip it
+        if not routing_rule.get("actions"):
+            print(
+                f"WARN: skipping global routing rule"
+                f" '{routing_rule.get('name') or routing_rule['unique_id']}'"
+                f" ({routing_rule['unique_id']}): it has no actions, which the"
+                " create API rejects; add an action in the source account to include it"
+            )
+            continue
         import_and_write(
             routing_rule.get("name") or routing_rule["unique_id"],
             "zenduty_globalrouting_rule",
             f"{router['unique_id']}/{routing_rule['unique_id']}",
             routing_rule["unique_id"],
         )
+
+
+def _tf(args):
+    return subprocess.run(["terraform", *args], cwd=OUTPUT_DIR, capture_output=True, text=True)
+
+
+def _tf_stream(args):
+    # stream terraform's output live so long plans don't look stuck, while
+    # still capturing it for error parsing
+    process = subprocess.Popen(
+        ["terraform", *args],
+        cwd=OUTPUT_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    lines = []
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+    process.wait()
+    return process.returncode, "".join(lines)
+
+
+def _check_terraform_version():
+    run = _tf(["version", "-json"])
+    try:
+        version = json.loads(run.stdout)["terraform_version"]
+        major, minor = (int(x) for x in version.split(".")[:2])
+    except Exception:
+        return
+    if (major, minor) < (1, 5):
+        sys.exit(f"--fast needs terraform >= 1.5 for import blocks (found {version})")
+
+
+def _advance_depth(line, depth):
+    # brace depth after this line, ignoring braces inside quoted strings
+    in_string = False
+    escaped = False
+    for ch in line:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string and ch == "{":
+            depth += 1
+        elif not in_string and ch == "}":
+            depth -= 1
+    return depth
+
+
+def _split_generated_blocks(text):
+    blocks = []
+    current = None
+    depth = 0
+    for line in text.splitlines():
+        start_depth = depth
+        depth = _advance_depth(line, depth)
+        if current is None:
+            if start_depth == 0:
+                match = re.match(r'^resource\s+"([a-z0-9_]+)"\s+"([^"]+)"', line)
+                if match:
+                    current = {"type": match.group(1), "name": match.group(2), "lines": [line]}
+        else:
+            current["lines"].append(line)
+            if depth == 0:
+                blocks.append(current)
+                current = None
+    return blocks
+
+
+def _postprocess_block(lines, entry):
+    # generated config includes every settable attribute; drop the ones the
+    # per-resource `terraform import` flow used to strip. Only top-level
+    # attributes are touched so values inside nested blocks or jsonencode()
+    # expressions survive; nested `attr = null` is valid HCL and stays.
+    # `provider` too: generate-config writes the provider's type name
+    # (zendutylocal) instead of the config's local name (zenduty), which makes
+    # terraform look for hashicorp/zendutylocal; the default provider from
+    # main.tf is correct for every resource, so the meta-argument just goes
+    skip_fields = SKIP_FIELDS + ("provider",) + tuple(entry.get("extra_skip") or ())
+    skip_pattern = re.compile(rf"^\s*({'|'.join(skip_fields)})\s*=")
+    null_pattern = re.compile(r"^\s*[A-Za-z0-9_]+\s*=\s*null\s*(#.*)?$")
+    result = [lines[0]]
+    if entry.get("extra_lines"):
+        result.extend(entry["extra_lines"])
+    depth = _advance_depth(lines[0], 0)
+    for line in lines[1:]:
+        start_depth = depth
+        depth = _advance_depth(line, depth)
+        if start_depth == 1 and (skip_pattern.match(line) or null_pattern.match(line)):
+            continue
+        result.append(line)
+    return result
+
+
+def _write_import_blocks(entries):
+    with open(out("imports.tf"), "w", encoding="utf-8") as f:
+        f.write("# generated by automate.py --fast; removed automatically after a successful import\n")
+        for entry in entries:
+            f.write(f'import {{\n  to = {entry["resource"]}.{entry["name"]}\n  id = "{entry["import_id"]}"\n}}\n')
+
+
+def _plan_counts(output):
+    match = re.search(r"Plan:(?:\s*(\d+) to import,)?\s*(\d+) to add,\s*(\d+) to change,\s*(\d+) to destroy", output)
+    if not match:
+        return None
+    return tuple(int(g or 0) for g in match.groups())
+
+
+def _flush_buffers_and_mapping(dropped_entries):
+    for file, texts in config_buffers.items():
+        with open(out(file), "a", encoding="utf-8") as f:
+            f.write("".join(texts))
+    config_buffers.clear()
+    dropped_addresses = {f'{e["resource"]}.{e["name"]}' for e in dropped_entries}
+    for key, value in list(create_mapping.items()):
+        if value.endswith(".id") and value[: -len(".id")] in dropped_addresses:
+            del create_mapping[key]
+    write_mapping_file()
+
+
+def run_fast_import():
+    _check_terraform_version()
+    generated_name = "generated.tf"
+    if os.path.exists(out(generated_name)):
+        os.remove(out(generated_name))
+
+    entries = list(fast_worklist)
+    dropped = []
+    if not entries:
+        print("nothing new to import")
+        _flush_buffers_and_mapping(dropped)
+        return
+
+    parallelism = os.environ.get("ZENDUTY_TF_PARALLELISM", "8")
+
+    for _ in range(4):
+        _write_import_blocks(entries)
+        print(f"importing {len(entries)} resources via a single terraform plan (parallelism {parallelism})")
+        returncode, output = _tf_stream(["plan", f"-generate-config-out={generated_name}", "-input=false",
+                                         "-no-color", f"-parallelism={parallelism}"])
+        if returncode == 0:
+            break
+        failed = set(re.findall(r"with (\w+\.\w+)", output))
+        failing_entries = [e for e in entries if f'{e["resource"]}.{e["name"]}' in failed]
+        if not failing_entries:
+            sys.exit(f"import plan failed and no failing resource could be identified:\n{output[-4000:]}")
+        if len(failing_entries) > max(20, len(entries) // 5):
+            sys.exit(
+                f"{len(failing_entries)} of {len(entries)} imports failed — aborting instead of dropping"
+                f" that many (rate limit or auth problem?):\n{output[-4000:]}"
+            )
+        for entry in failing_entries:
+            print(f'WARN: dropping {entry["resource"]}.{entry["name"]} ({entry["import_id"]}): import failed')
+            dropped.append(entry)
+        entries = [e for e in entries if e not in failing_entries]
+        if os.path.exists(out(generated_name)):
+            os.remove(out(generated_name))
+    else:
+        sys.exit("import plan still failing after 4 attempts")
+
+    with open(out(generated_name), encoding="utf-8") as f:
+        generated_text = f.read()
+    by_address = {f'{e["resource"]}.{e["name"]}': e for e in entries}
+    blocks = _split_generated_blocks(generated_text)
+    generated_addresses = {f'{b["type"]}.{b["name"]}' for b in blocks}
+    for address in sorted(set(by_address) - generated_addresses):
+        print(f"WARN: no config was generated for {address}; dropping it")
+        dropped.append(by_address[address])
+    written = 0
+    for block in blocks:
+        entry = by_address.get(f'{block["type"]}.{block["name"]}')
+        if entry is None:
+            continue
+        lines = _postprocess_block(block["lines"], entry)
+        with open(out(f'{block["type"]}.tf'), "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        written += 1
+    os.remove(out(generated_name))
+
+    # data-source blocks (applications, contacts, owner) join the config now so
+    # the verification plan exercises them too
+    for file, texts in config_buffers.items():
+        with open(out(file), "a", encoding="utf-8") as f:
+            f.write("".join(texts))
+    config_buffers.clear()
+
+    print("running verification plan (must be import-only before anything is applied)")
+    returncode, output = _tf_stream(["plan", "-input=false", "-no-color",
+                                     f"-parallelism={parallelism}", "-out=fast.tfplan"])
+    if returncode != 0:
+        sys.exit("verification plan failed; imports.tf is kept for inspection (output above)")
+    counts = _plan_counts(output)
+    if counts is None or counts[1:] != (0, 0, 0):
+        sys.exit(
+            f"verification plan is not import-only (import/add/change/destroy = {counts});"
+            " aborting before apply so the source account is never modified."
+            " imports.tf and the generated config are kept for inspection."
+        )
+    print("committing imports to state")
+    returncode, output = _tf_stream(["apply", "-input=false", "-no-color", "fast.tfplan"])
+    if returncode != 0:
+        sys.exit("apply of the import plan failed (output above)")
+
+    # leftover import blocks would error on the next plan once the resources
+    # are already in state
+    os.remove(out("imports.tf"))
+    os.remove(out("fast.tfplan"))
+    _flush_buffers_and_mapping(dropped)
+    print(f"imported {written} resources, dropped {len(dropped)}")
+    if dropped:
+        by_type = {}
+        for entry in dropped:
+            by_type[entry["resource"]] = by_type.get(entry["resource"], 0) + 1
+        for resource, count in sorted(by_type.items(), key=lambda x: -x[1]):
+            print(f"WARN: dropped {count} {resource} resources — they are missing from config,"
+                  " state and mapping.json")
+
+
+if FAST_MODE:
+    run_fast_import()
 
 # temp1.tf only exists so `terraform import` can find the resource address; leaving it
 # behind duplicates the last imported resource and breaks `terraform plan`

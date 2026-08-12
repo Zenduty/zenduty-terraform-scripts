@@ -40,18 +40,103 @@ Both scripts accept an alternative export folder, either as the first argument
 (`python automate.py prod-backup`) or via `ZENDUTY_EXPORT_DIR`. Use the same
 folder for both scripts.
 
+### Applying an export to another instance (migration)
+
+Don't apply an export to a fresh instance with plain `terraform apply`:
+creating a team makes the backend auto-create a "Default Escalation Policy",
+an "Incident Commander" incident role, and a membership for the API user, and
+the export contains the source account's copies of the first two. A plain
+apply therefore fails on every role ("incident role with the name already
+exists") and silently duplicates every default escalation policy. (The
+auto-added member is harmless — the API tolerates re-adding an existing
+member.)
+
+`import/apply.py` wraps the apply to handle this: it applies the
+`zenduty_teams` resources first, binds each auto-created default to its
+exported counterpart with terraform `import` blocks (so the full apply
+updates it in place instead of recreating it), deletes auto-created defaults
+the source team had renamed or deleted, and then runs the full apply.
+
+```bash
+# point the provider block in <folder>/main.tf at the TARGET instance
+# (base_url + token) and reset/remove any state bound to the source first
+python apply.py <folder>
+```
+
+The script reads the target's address and credentials from the provider block
+in `<folder>/main.tf` (override with `ZENDUTY_TARGET_BASE_URL` /
+`ZENDUTY_TARGET_API_KEY`). Re-running after a partial failure is safe: teams
+already in state are skipped, only unmanaged defaults are adopted, and
+deletes only target objects that still exist unmatched.
+
+A faithful export can also contain states the current create APIs no longer
+accept — stored data that predates today's validation. Objects that could
+never be created are skipped at export time with a warning (escalation
+policies with no targeted rules, global routing rules with no actions, alert
+rules whose every action lost its target object); everything else apply.py
+rewrites in place before applying, printing each change: target-less rules
+are stripped from escalation policies, broken actions from alert rules,
+non-member users from schedule layers and overrides (the API's own advice),
+HTML/URLs from user names, inconsistent collation fields are normalised, and
+services pointing at an escalation policy that no longer exists fall back to
+the team's default. If the apply still fails, it is retried once serially
+(`-parallelism=1`): parallel user invites can exhaust the backend's row
+locks, which surface as 500s with MySQL 1205 lock waits.
+
+### Fast mode (the default)
+
+Fast mode is used automatically whenever `terraform` ≥ 1.5 is on PATH; pass
+`--slow` (or `ZENDUTY_FAST_IMPORT=0`) to force the old per-resource path, or
+`--fast` (or `ZENDUTY_FAST_IMPORT=1`) to fail instead of falling back on older
+terraform versions. It enumerates every resource via the API first (threaded, auto-sized to
+`min(32, cores + 4)`; `ZENDUTY_ENUM_THREADS` overrides) and then imports them
+all with a single
+`terraform plan -generate-config-out` (import blocks), instead of two
+terraform subprocesses per resource. API calls are paced by a shared adaptive
+rate limiter (AIMD: starts at `ZENDUTY_API_RPS`, default 8/s; a 429 halves the
+shared rate and backs all threads off together, sustained success raises it
+again), so the thread count just provides concurrency while throughput
+converges on whatever the API allows. Provider reads during the terraform
+phase run in parallel too (`ZENDUTY_TF_PARALLELISM`, default 10). Together
+this turns an hour-long export into a few minutes. Progress streams live: `queued <address>`
+lines during enumeration, then terraform's own per-resource output during the
+import plan. It refuses to apply anything but pure imports, so the source
+account is never modified. Use it on a fresh export folder; if a fast run
+aborts partway, start over with a fresh folder rather than re-running into the
+same one.
+
 ### What gets imported
 
-All 22 importable resource types: users, teams, team members, schedules,
+All 21 importable resource types: users, teams, team members, schedules,
 escalation policies, SLAs, incident roles, tags, priorities, services,
 integrations, alert rules, outgoing rules, maintenance windows, post-incident
-tasks, task templates (+ tasks), team permissions, user notification rules,
+tasks, task templates (+ tasks), team permissions,
 account custom roles, global routers, and global routing rules.
 
 Not imported:
 
 - `zenduty_invite`, `zenduty_assign_account_role` — the provider has no importer for these.
 - `zenduty_incidents` — importable but deliberately skipped; incidents are runtime data, not configuration.
+- User notification rules — deliberately skipped; they are personal per-user
+  preferences tied to contact-method UUIDs that only exist once the user
+  completes signup on the target, and the invite already creates a default
+  set there. (The `data "zenduty_usercontact"` lookups existed only to serve
+  them, so they are no longer generated either.)
+- Bot users (no email) — the provider cannot manage them.
+- The account owner (role 1) is not imported as a resource; a `data "zenduty_user"`
+  block is generated instead so other resources can reference the owner.
+
+The Zenduty invite API always requires a destination team, so every imported user
+gets a deterministic `team`: a team named `GLOBAL` (override with
+`ZENDUTY_INVITE_TEAM`), created automatically on the first run if missing.
+
+Provider requirement: the generated config relies on provider behavior newer than
+registry release 1.0.6 — optional schedule layer/override names and
+whitespace-tolerant user last names. `import/main.tf` points at the local dev
+build (`local.zenduty.com/dev/zendutylocal`); build and install it with
+`smoke-test/scripts/run.sh` (or `go build` into
+`~/.terraform.d/plugins/local.zenduty.com/dev/zendutylocal/0.0.1/<os_arch>/`)
+before running the import.
 
 ### Re-running
 
