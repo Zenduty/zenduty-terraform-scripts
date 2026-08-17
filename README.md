@@ -6,6 +6,7 @@ Tooling for managing Zenduty with Terraform.
 
 | Folder | Purpose |
 |---|---|
+| [`MIGRATION.md`](MIGRATION.md) | **Support runbook** for migrating an account to another instance, driven by [`import/migrate.sh`](import/migrate.sh) |
 | [`import/`](import/) | Export an entire Zenduty account into Terraform config + state (see below) |
 | [`smoke-test/`](smoke-test/) | Smoke tests for the `terraform-provider-zenduty` provider — see its [README](smoke-test/README.md) |
 | `eu-migration/`, `zenduty-terraform/` | Historical one-offs, kept for reference only |
@@ -42,6 +43,24 @@ folder for both scripts.
 
 ### Applying an export to another instance (migration)
 
+> **Just need to run a migration?** Use the guided wrapper
+> `import/migrate.sh` as described in [MIGRATION.md](MIGRATION.md) — it
+> prompts for credentials, chains export → findreplace → verify → apply →
+> verify, logs every phase, and adds safety checks (mechanical "No changes"
+> verification, typed-hostname confirmation, refusal to reuse a folder
+> against a different target). This section is the technical background for
+> engineers running the pieces by hand.
+
+An export is portable across Zenduty instances: nothing instance-specific is
+hardcoded in the generated config. `findreplace.py` rewrites every raw UUID
+into a reference to the terraform resource that owns it, so IDs are minted
+fresh on whatever instance the apply targets. The one class of IDs that
+belongs to the instance rather than the account — the integration application
+catalog — is emitted as `data "zenduty_applications"` name lookups that
+resolve at plan time against the target. This means the target's catalog must
+contain the same applications by name; lookups for applications the target
+doesn't have fail at plan time until they are seeded there.
+
 Don't apply an export to a fresh instance with plain `terraform apply`:
 creating a team makes the backend auto-create a "Default Escalation Policy",
 an "Incident Commander" incident role, and a membership for the API user, and
@@ -58,14 +77,20 @@ updates it in place instead of recreating it), deletes auto-created defaults
 the source team had renamed or deleted, and then runs the full apply.
 
 ```bash
-# point the provider block in <folder>/main.tf at the TARGET instance
-# (base_url + token) and reset/remove any state bound to the source first
+# 1. point the provider block in <folder>/main.tf at the TARGET instance
+#    (base_url + token), and remove any state bound to the source
+#    (terraform.tfstate) — the migration starts from an empty state
+# 2. tell apply.py where its own API calls (adopting/deleting the
+#    auto-created defaults) should go — defaults to http://localhost:8000
+export ZENDUTY_TARGET_BASE_URL=<target url>
 python apply.py <folder>
 ```
 
-The script reads the target's address and credentials from the provider block
-in `<folder>/main.tf` (override with `ZENDUTY_TARGET_BASE_URL` /
-`ZENDUTY_TARGET_API_KEY`). Re-running after a partial failure is safe: teams
+Terraform itself talks to whatever the provider block in `<folder>/main.tf`
+says. apply.py's direct API calls use the token from that provider block
+(`ZENDUTY_TARGET_API_KEY` overrides it) and the address from
+`ZENDUTY_TARGET_BASE_URL` (default `http://localhost:8000`) — keep the two
+pointed at the same instance. Re-running after a partial failure is safe: teams
 already in state are skipped, only unmanaged defaults are adopted, and
 deletes only target objects that still exist unmatched.
 
@@ -130,13 +155,15 @@ The Zenduty invite API always requires a destination team, so every imported use
 gets a deterministic `team`: a team named `GLOBAL` (override with
 `ZENDUTY_INVITE_TEAM`), created automatically on the first run if missing.
 
-Provider requirement: the generated config relies on provider behavior newer than
-registry release 1.0.6 — optional schedule layer/override names and
-whitespace-tolerant user last names. `import/main.tf` points at the local dev
-build (`local.zenduty.com/dev/zendutylocal`); build and install it with
+Provider requirement: the generated config needs registry release **2.0.0 or
+newer** — it uses the `zenduty_applications` data source and relies on
+optional schedule layer/override names and whitespace-tolerant user last
+names, none of which exist in 1.0.6. `import/main.tf` points at the registry
+provider (`zenduty/zenduty`), and `terraform init` picks up the latest
+release. To test an unreleased provider build instead, install it with
 `smoke-test/scripts/run.sh` (or `go build` into
 `~/.terraform.d/plugins/local.zenduty.com/dev/zendutylocal/0.0.1/<os_arch>/`)
-before running the import.
+and change the `source` in `main.tf` to `local.zenduty.com/dev/zendutylocal`.
 
 ### Re-running
 

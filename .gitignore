@@ -10,3 +10,4 @@ crash.log
 .venv/
 __pycache__/
 import/export/
+import/logs/
