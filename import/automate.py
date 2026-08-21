@@ -876,6 +876,214 @@ def _flush_buffers_and_mapping(dropped_entries):
     write_mapping_file()
 
 
+def _hcl_quoted(value):
+    # HCL's quoted-string escapes are JSON's; the two template sigils are the
+    # only extras, and doubling them keeps the literal inert
+    return json.dumps(value).replace("${", "$${").replace("%{", "%%{")
+
+
+def _bracket_depth(line, depth):
+    # bracket depth after this line, ignoring brackets inside quoted strings.
+    # generate-config-out never emits heredocs, so quote tracking is enough
+    in_string = False
+    escaped = False
+    for ch in line:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+    return depth
+
+
+def _same_json(before, after):
+    # one JSON document rendered two ways: jsonencode() sorts object keys and
+    # drops whitespace, the API hands back whatever order it was sent in
+    if not isinstance(before, str) or not isinstance(after, str) or before == after:
+        return False
+    try:
+        return json.loads(before) == json.loads(after)
+    except ValueError:
+        return False
+
+
+def _diff_leaves(before, after, path=()):
+    # every differing leaf of the plan's before/after, with the path to it
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in sorted(set(before) | set(after)):
+            yield from _diff_leaves(before.get(key), after.get(key), path + (key,))
+    elif isinstance(before, list) and isinstance(after, list) and len(before) == len(after):
+        for index, (b, a) in enumerate(zip(before, after)):
+            yield from _diff_leaves(b, a, path + (index,))
+    elif before != after:
+        yield path, before, after
+
+
+def _json_reorder_fixes(plan_file="fast.tfplan"):
+    """Split the plan's updates into cosmetic JSON reorderings and real drift.
+
+    Returns (fixes, blockers): fixes are (address, path, remote_value) for
+    attributes where config and remote hold the same JSON document in a
+    different key order; blockers describe anything else the plan wants to
+    change. A resource contributes to both if it has some of each.
+    """
+    run = _tf(["show", "-json", plan_file])
+    if run.returncode != 0:
+        return [], [f"terraform show -json {plan_file} failed: {(run.stderr or '').strip()}"]
+    try:
+        plan = json.loads(run.stdout)
+    except ValueError as e:
+        return [], [f"could not parse the plan JSON: {e}"]
+    fixes, blockers = [], []
+    for change in plan.get("resource_changes") or []:
+        delta = change.get("change") or {}
+        if "update" not in (delta.get("actions") or []):
+            continue
+        address = change.get("address", "?")
+        leaves = list(_diff_leaves(delta.get("before"), delta.get("after")))
+        if not leaves:
+            blockers.append(f"{address}: plan wants an update but no attribute differs")
+            continue
+        for path, before, after in leaves:
+            where = ".".join(str(p) for p in path) or "(root)"
+            if _same_json(before, after):
+                fixes.append((address, path, before))
+            else:
+                blockers.append(f"{address}: {where} differs for real")
+    return fixes, blockers
+
+
+def _resource_range(lines, resource_type, name):
+    # body line range (start, end) of one resource block, end exclusive
+    header = re.compile(rf'^resource\s+"{re.escape(resource_type)}"\s+"{re.escape(name)}"')
+    for number, line in enumerate(lines):
+        if header.match(line):
+            last = number
+            depth = _bracket_depth(line, 0)
+            while depth > 0 and last + 1 < len(lines):
+                last += 1
+                depth = _bracket_depth(lines[last], depth)
+            return number + 1, last
+    return None
+
+
+def _nth_block(lines, start, end, name, occurrence):
+    # body of the occurrence-th `name {` / `name = {` at the top level of a region
+    pattern = re.compile(rf"^\s*{re.escape(name)}\s*(=\s*)?\{{\s*$")
+    depth = 0
+    seen = -1
+    for number in range(start, end):
+        if depth == 0 and pattern.match(lines[number]):
+            seen += 1
+            if seen == occurrence:
+                last = number
+                inner = _bracket_depth(lines[number], 0)
+                while inner > 0 and last + 1 < end:
+                    last += 1
+                    inner = _bracket_depth(lines[last], inner)
+                return number + 1, last
+        depth = _bracket_depth(lines[number], depth)
+    return None
+
+
+def _assignment_range(lines, start, end, name):
+    # line range of `name = <expr>`, following the expression across lines
+    pattern = re.compile(rf"^\s*{re.escape(name)}\s*=")
+    depth = 0
+    for number in range(start, end):
+        if depth == 0 and pattern.match(lines[number]):
+            last = number
+            open_depth = _bracket_depth(lines[number], 0)
+            while open_depth > 0 and last + 1 < end:
+                last += 1
+                open_depth = _bracket_depth(lines[last], open_depth)
+            return number, last
+        depth = _bracket_depth(lines[number], depth)
+    return None
+
+
+def _resolve_attribute(lines, start, end, path):
+    """Line range of the attribute a plan path names, or None if unmappable.
+
+    Plan paths mix attribute names with list indices. A name followed by an
+    index is a repeated nested block (`actions { ... }` twice over), a name
+    followed by a name is a single nested block, and a trailing name is the
+    assignment itself. None means "this shape isn't understood" — callers must
+    then leave the config untouched rather than guess.
+    """
+    position = 0
+    while position < len(path):
+        name = path[position]
+        if not isinstance(name, str):
+            return None
+        position += 1
+        occurrence = 0
+        if position < len(path) and isinstance(path[position], int):
+            occurrence = path[position]
+            position += 1
+        if position < len(path):
+            found = _nth_block(lines, start, end, name, occurrence)
+            if found is None:
+                return None
+            start, end = found
+            continue
+        if occurrence:
+            return None
+        return _assignment_range(lines, start, end, name)
+    return None
+
+
+def _rewrite_json_attributes(fixes):
+    """Pin jsonencode()-rendered attributes to the literal the API returned.
+
+    generate-config-out renders a JSON string attribute as jsonencode({...}),
+    which re-serialises with sorted keys. When the source account stored the
+    same document in another key order, terraform reports a permanent update:
+    it fails the import-only gate, and applying it would rewrite the value in
+    the source account to say exactly what it already says. Writing the remote
+    literal into the config makes the plan clean instead.
+    """
+    by_file = {}
+    for address, path, remote in fixes:
+        resource_type, _, name = address.partition(".")
+        by_file.setdefault(f"{resource_type}.tf", []).append((resource_type, name, path, remote))
+    rewritten = 0
+    for file, items in sorted(by_file.items()):
+        file_path = out(file)
+        if not os.path.exists(file_path):
+            print(f"WARN: {file} is missing; cannot pin its JSON attributes")
+            continue
+        with open(file_path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        changed = False
+        for resource_type, name, path, remote in items:
+            where = ".".join(str(p) for p in path)
+            block = _resource_range(lines, resource_type, name)
+            if block is None:
+                print(f"WARN: no config block for {resource_type}.{name}; leaving {where} alone")
+                continue
+            located = _resolve_attribute(lines, block[0], block[1], path)
+            if located is None:
+                print(f"WARN: could not locate {where} in {resource_type}.{name}; leaving it alone")
+                continue
+            first, last = located
+            indent = lines[first][: len(lines[first]) - len(lines[first].lstrip())]
+            lines[first:last + 1] = [f"{indent}{path[-1]} = {_hcl_quoted(remote)}"]
+            print(f"pinned {resource_type}.{name} {where} to the value the API returned")
+            rewritten += 1
+            changed = True
+        if changed:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+    return rewritten
+
+
 def run_fast_import():
     _check_terraform_version()
     generated_name = "generated.tf"
@@ -942,18 +1150,40 @@ def run_fast_import():
             f.write("".join(texts))
     config_buffers.clear()
 
-    print("running verification plan (must be import-only before anything is applied)")
-    returncode, output = _tf_stream(["plan", "-input=false", "-no-color",
-                                     f"-parallelism={parallelism}", "-out=fast.tfplan"])
-    if returncode != 0:
-        sys.exit("verification plan failed; imports.tf is kept for inspection (output above)")
-    counts = _plan_counts(output)
-    if counts is None or counts[1:] != (0, 0, 0):
-        sys.exit(
+    def gate_failure(counts):
+        return (
             f"verification plan is not import-only (import/add/change/destroy = {counts});"
             " aborting before apply so the source account is never modified."
             " imports.tf and the generated config are kept for inspection."
         )
+
+    # a cosmetic jsonencode() key reorder can be pinned out of the plan and the
+    # gate re-checked; anything else still aborts, so the plan that reaches the
+    # apply below is import-only on its own terms and never edits the source
+    counts = None
+    for attempt in range(3):
+        print("running verification plan (must be import-only before anything is applied)")
+        returncode, output = _tf_stream(["plan", "-input=false", "-no-color",
+                                         f"-parallelism={parallelism}", "-out=fast.tfplan"])
+        if returncode != 0:
+            sys.exit("verification plan failed; imports.tf is kept for inspection (output above)")
+        counts = _plan_counts(output)
+        if counts is None:
+            sys.exit(gate_failure(counts))
+        if counts[1:] == (0, 0, 0):
+            break
+        # only in-place updates can be cosmetic: an add or a destroy never is
+        if counts[1] or counts[3] or attempt == 2:
+            sys.exit(gate_failure(counts))
+        fixes, blockers = _json_reorder_fixes()
+        for blocker in blockers:
+            print(f"BLOCKED: {blocker}")
+        if blockers or not fixes:
+            sys.exit(gate_failure(counts))
+        if not _rewrite_json_attributes(fixes):
+            sys.exit(gate_failure(counts))
+    else:
+        sys.exit(gate_failure(counts))
     print("committing imports to state")
     returncode, output = _tf_stream(["apply", "-input=false", "-no-color", "fast.tfplan"])
     if returncode != 0:

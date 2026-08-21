@@ -73,8 +73,11 @@ member.)
 `import/apply.py` wraps the apply to handle this: it applies the
 `zenduty_teams` resources first, binds each auto-created default to its
 exported counterpart with terraform `import` blocks (so the full apply
-updates it in place instead of recreating it), deletes auto-created defaults
-the source team had renamed or deleted, and then runs the full apply.
+updates it in place instead of recreating it), reconciles the defaults the
+source team had renamed or deleted — the incident role is deleted via the API,
+while the default escalation policy (which the backend refuses to delete) is
+bound to another exported policy of the same team and renamed in place — and
+then runs the full apply.
 
 ```bash
 # 1. point the provider block in <folder>/main.tf at the TARGET instance

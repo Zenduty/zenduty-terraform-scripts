@@ -24,7 +24,11 @@ This script wraps the apply in three steps:
    team by the default name) with an `import` block, so the final apply
    updates it in place instead of creating a duplicate; auto-created objects
    with no exported counterpart — the source team renamed or deleted theirs —
-   are deleted via the API to keep the target faithful to the source;
+   are deleted via the API to keep the target faithful to the source, except
+   for the default escalation policy, which the backend refuses to delete
+   ("You cannot delete a default escalation policy"): that one is bound to
+   another exported policy of the same team instead, so the apply renames it
+   in place rather than leaving it behind next to a freshly created one;
 3. run the full apply (retried once serially: parallel invites can exhaust
    the backend's row locks, surfacing as 500s with MySQL 1205 lock waits).
 
@@ -67,6 +71,9 @@ ADOPTIONS = [
         "team_attr": "team_id",
         "name_attr": "name",
         "default_name": "Default Escalation Policy",
+        # the backend rejects DELETE on a team's default policy, so an
+        # unmatched one is adopted by another exported policy instead
+        "undeletable": True,
     },
 ]
 
@@ -187,25 +194,47 @@ def api_delete(base_url, token, path):
         sys.exit(f"DELETE {path} failed {response.status_code}: {response.text[:500]}")
 
 
-def exported_default_blocks(spec, state_addresses):
-    """Exported counterparts of the auto-created default, keyed by team address.
+def exported_team_blocks(spec, state_addresses):
+    """Adoption candidates per team address, as `(address, is_default)` pairs.
 
     Only blocks not yet in state are candidates — anything already managed was
-    adopted or created on a previous run.
+    adopted or created on a previous run. `is_default` marks the exported
+    counterpart of the auto-created object (same name); the others are only
+    used as a fallback for objects the backend refuses to delete. File order
+    is preserved, so the fallback pick is deterministic across runs.
     """
     candidates = {}
     for block in parse_resource_blocks(out(f'{spec["resource"]}.tf'), spec["resource"]):
         address = f'{spec["resource"]}.{block["name"]}'
         if address in state_addresses:
             continue
-        if block["attrs"].get(spec["name_attr"]) != f'"{spec["default_name"]}"':
-            continue
         team_ref = re.fullmatch(
             r"zenduty_teams\.([A-Za-z0-9_]+)\.id", block["attrs"].get(spec["team_attr"], "")
         )
-        if team_ref:
-            candidates.setdefault(f"zenduty_teams.{team_ref.group(1)}", []).append(address)
+        if not team_ref:
+            continue
+        is_default = block["attrs"].get(spec["name_attr"]) == f'"{spec["default_name"]}"'
+        candidates.setdefault(f"zenduty_teams.{team_ref.group(1)}", []).append((address, is_default))
     return candidates
+
+
+def take_candidate(candidates, team_address, spec):
+    """Claim the exported block the auto-created object should bind to.
+
+    Returns `(address, matched_by_name)`, or `(None, False)` when nothing is
+    left to bind. The exported object of the same name is the natural
+    counterpart; when the source renamed or deleted it, an undeletable object
+    borrows any other exported block of the same kind on that team so the
+    apply renames it in place instead of adding a duplicate.
+    """
+    waiting = candidates.get(team_address) or []
+    for index, (address, is_default) in enumerate(waiting):
+        if is_default:
+            waiting.pop(index)
+            return address, True
+    if spec.get("undeletable") and waiting:
+        return waiting.pop(0)[0], False
+    return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -652,8 +681,9 @@ def main():
 
     imports = []
     deletes = []
+    strays = []
     for spec in ADOPTIONS:
-        candidates = exported_default_blocks(spec, state_addresses)
+        candidates = exported_team_blocks(spec, state_addresses)
         for team_address, team_id in team_ids.items():
             if not team_id:
                 continue
@@ -662,15 +692,29 @@ def main():
                     continue
                 if obj["unique_id"] in managed_ids.get(spec["resource"], set()):
                     continue
-                waiting = candidates.get(team_address)
-                if waiting:
-                    imports.append((waiting.pop(0), f'{team_id}/{obj["unique_id"]}'))
+                address, matched_by_name = take_candidate(candidates, team_address, spec)
+                if address and not matched_by_name:
+                    print(
+                        f'adopting auto-created "{spec["default_name"]}" on {team_address} as'
+                        f" {address}: no exported counterpart, and the backend refuses to"
+                        " delete it"
+                    )
+                if address:
+                    imports.append((address, f'{team_id}/{obj["unique_id"]}'))
+                elif spec.get("undeletable"):
+                    strays.append((spec, team_address))
                 else:
                     deletes.append((spec, team_address, team_id, obj["unique_id"]))
 
     for spec, team_address, team_id, obj_id in deletes:
         print(f'deleting auto-created "{spec["default_name"]}" on {team_address}: no exported counterpart')
         api_delete(base_url, token, f"/api/account/teams/{team_id}/{spec['endpoint']}/{obj_id}/")
+
+    for spec, team_address in strays:
+        print(
+            f'keeping auto-created "{spec["default_name"]}" on {team_address}: the export has no'
+            f" {spec['resource']} for this team and the backend refuses to delete it"
+        )
 
     if imports:
         with open(out(ADOPT_FILE), "w", encoding="utf-8") as f:
