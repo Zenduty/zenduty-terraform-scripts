@@ -5,9 +5,10 @@ Policy", an "Incident Commander" incident role, and a membership for the API
 user. The export contains the source account's copies of those objects, so a
 plain `terraform apply` collides with the ones the target just auto-created:
 role creation fails with "incident role with the name already exists" (role
-titles are unique per team), and the default escalation policy is silently
-duplicated. The auto-added member never collides (the API tolerates re-adding
-an existing member), so it needs no handling here.
+titles are unique per team), the default escalation policy is silently
+duplicated, and re-creating the auto-added membership fails with "User
+already exists" wherever the export also contains a membership for the API
+user.
 
 A faithful export can also contain states the current create APIs no longer
 accept — stored data that predates today's validation (escalation policy rules
@@ -21,7 +22,8 @@ This script wraps the apply in three steps:
 1. apply only the zenduty_teams resources, letting the backend create the
    default objects as a side effect;
 2. bind each auto-created object to its exported counterpart (matched per
-   team by the default name) with an `import` block, so the final apply
+   team by the default name; memberships by the member's email) with an
+   `import` block, so the final apply
    updates it in place instead of creating a duplicate; auto-created objects
    with no exported counterpart — the source team renamed or deleted theirs —
    are deleted via the API to keep the target faithful to the source, except
@@ -235,6 +237,66 @@ def take_candidate(candidates, team_address, spec):
     if spec.get("undeletable") and waiting:
         return waiting.pop(0)[0], False
     return None, False
+
+
+def _exported_user_emails():
+    """Map each user reference expression the export uses to an email address.
+
+    Members reference created users as `zenduty_user.<n>.id` and pre-existing
+    (data-source) users as `data.zenduty_user.<n>.users[0].username`; both
+    blocks carry the email, the only identifier shared with the target.
+    """
+    emails = {}
+    for block in parse_resource_blocks(out("zenduty_user.tf"), "zenduty_user"):
+        email = block["attrs"].get("email", "").strip('"')
+        if email:
+            emails[f'zenduty_user.{block["name"]}.id'] = email
+    if os.path.exists(out("zenduty_user.tf")):
+        with open(out("zenduty_user.tf"), encoding="utf-8") as f:
+            text = f.read()
+        for match in re.finditer(
+            r'data\s+"zenduty_user"\s+"([A-Za-z0-9_]+)"\s*\{[^}]*?email\s*=\s*"([^"]+)"', text
+        ):
+            emails[f"data.zenduty_user.{match.group(1)}.users[0].username"] = match.group(2)
+    return emails
+
+
+def adopt_existing_memberships(base_url, token, team_ids, state_addresses):
+    """Import ids for exported memberships that already exist on the target.
+
+    Team creation auto-adds the API user as a member, and the backend rejects
+    re-adding an existing member ("User already exists"), so an exported
+    membership for that user can never be created. Bind it to the existing
+    membership instead — matched by email — so the final apply updates it in
+    place (e.g. its role) rather than failing to create a duplicate.
+    """
+    emails = _exported_user_emails()
+    pending = {}
+    for block in parse_resource_blocks(out("zenduty_member.tf"), "zenduty_member"):
+        address = f'zenduty_member.{block["name"]}'
+        if address in state_addresses:
+            continue
+        team_ref = re.fullmatch(r"zenduty_teams\.([A-Za-z0-9_]+)\.id", block["attrs"].get("team", ""))
+        email = emails.get(block["attrs"].get("user", ""))
+        if team_ref and email:
+            pending.setdefault(f"zenduty_teams.{team_ref.group(1)}", []).append((address, email))
+
+    imports = []
+    for team_address, members in pending.items():
+        team_id = team_ids.get(team_address)
+        if not team_id:
+            continue
+        existing = {}
+        for obj in api_get(base_url, token, f"/api/account/teams/{team_id}/members/"):
+            user_email = (obj.get("user") or {}).get("email")
+            if user_email:
+                existing[user_email] = obj["unique_id"]
+        for address, email in members:
+            membership_id = existing.get(email)
+            if membership_id:
+                print(f"adopting existing membership on {team_address} as {address}")
+                imports.append((address, f"{team_id}/{membership_id}"))
+    return imports
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +767,8 @@ def main():
                     strays.append((spec, team_address))
                 else:
                     deletes.append((spec, team_address, team_id, obj["unique_id"]))
+
+    imports.extend(adopt_existing_memberships(base_url, token, team_ids, state_addresses))
 
     for spec, team_address, team_id, obj_id in deletes:
         print(f'deleting auto-created "{spec["default_name"]}" on {team_address}: no exported counterpart')

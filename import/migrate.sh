@@ -88,6 +88,7 @@ apply)
     [[ -f "$CUSTOMER/zenduty_teams.tf" ]] || die "$CUSTOMER/ is not an export folder — run: ./migrate.sh export $CUSTOMER"
 
     read -r -p "TARGET instance URL: " TARGET_URL
+    TARGET_URL=${TARGET_URL%/}   # normalize: a trailing slash must not read as a different target
     [[ -n "$TARGET_URL" ]] || die "target URL is required"
     prompt_key "TARGET"
     TARGET_KEY=$REPLY

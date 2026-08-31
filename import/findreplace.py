@@ -28,10 +28,19 @@ def direct_replace_ids(file_path: str, mapping_path: str) -> None:
 
     # Sort keys by length to avoid partial match issues
     for old, new in sorted(mapping.items(), key=lambda x: -len(x[0])):
-        # Replace quoted occurrences → unquoted Terraform reference
+        # Replace exactly-quoted occurrences → unquoted Terraform reference
         content = re.sub(rf'"{re.escape(old)}"', new, content)
-        # Replace unquoted occurrences (token boundary) → Terraform reference
-        content = re.sub(rf"\b{re.escape(old)}\b", new, content)
+
+        # Remaining occurrences are either bare tokens or embedded in a larger
+        # string (e.g. a comma-joined tag list: "uuid1,uuid2"). Inside a string
+        # the reference must be interpolated (${ref}), or Terraform treats it
+        # as literal text.
+        def repl(m, new=new):
+            line_start = m.string.rfind("\n", 0, m.start()) + 1
+            quotes = len(re.findall(r'(?<!\\)"', m.string[line_start : m.start()]))
+            return f"${{{new}}}" if quotes % 2 else new
+
+        content = re.sub(rf"\b{re.escape(old)}\b", repl, content)
 
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(content)
