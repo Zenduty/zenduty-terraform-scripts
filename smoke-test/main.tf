@@ -167,6 +167,11 @@ resource "zenduty_esp" "main" {
   description = "Smoke-test escalation policy"
   team_id     = zenduty_teams.a.id
 
+  # Round-robin assignment: a PUT without these used to reset the policy to
+  # the defaults, so the plan-check stage must stay empty with them set.
+  assignee_strategy                = 2
+  notify_round_robin_assignee_only = true
+
   rules {
     delay = 0
     targets {
