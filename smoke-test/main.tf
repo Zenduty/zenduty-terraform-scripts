@@ -417,9 +417,11 @@ resource "zenduty_account_setting" "main" {
 }
 
 # No secrets on purpose: the API masks them on read, so an import round-trip
-# with secrets would (correctly) show them as missing from state.
+# with secrets would (correctly) show them as missing from state. The host
+# must resolve publicly and be off the backend's block list (example.com and
+# zenduty.com are blocked), hence httpbin.
 resource "zenduty_webhook_configuration" "main" {
-  url    = "https://example.com/${var.name_prefix}"
+  url    = "https://httpbin.org/anything/${var.name_prefix}"
   event  = ["incident_create", "incident_resolve"]
   filter = jsonencode({ smoke = true })
 }

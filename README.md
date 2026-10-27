@@ -135,7 +135,7 @@ same one.
 
 ### What gets imported
 
-All 33 importable resource types: users, teams, team members, schedules,
+All 34 importable resource types: users, teams, team members, schedules,
 escalation policies, SLAs, incident roles, tags, priorities, services,
 integrations, alert rules, outgoing rules, alert grouping policies, team and
 service maintenance windows, maintenance templates, service context

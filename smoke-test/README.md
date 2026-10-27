@@ -46,7 +46,7 @@ Or stage by stage: `build`, `validate`, `apply`, `plan-check`, `import`,
 | Stage | Proves |
 |---|---|
 | `validate` | every config block type-checks against the new provider schemas |
-| `apply` | all 35 resources create against the real API, incl. alert-rule `conditions`, SLA responders, `urgency = 0` incidents, and the resources added in provider 2.2.0 (heartbeat, account settings, webhook, stakeholder template, service maintenance window, maintenance template, service context, incident custom field + type, forwarding rule) |
+| `apply` | all 34 resources (35 with the opt-in workflow) create against the real API, incl. alert-rule `conditions`, SLA responders, `urgency = 0` incidents, and the resources added in provider 2.2.0 (heartbeat, account settings, webhook, stakeholder template, service maintenance window, maintenance template, service context, incident custom field + type, forwarding rule) |
 | `plan-check` | empty plan right after apply — no perpetual diffs anywhere |
 | `import` | every importer parses its documented ID, every Read rebuilds full state, plan stays empty afterwards |
 | `selfheal` | a resource deleted behind Terraform's back is re-planned, not an error (typed-404 path against real API error bodies) |

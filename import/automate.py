@@ -382,9 +382,12 @@ def _parse_api_time(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    # a naive timestamp cannot be compared with an aware "now"; the API sends
+    # UTC, so treat it as such
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def maintenance_window_ended(window):
@@ -498,6 +501,12 @@ if default_team is None:
 
 all_users = client.execute(ZendutyClientRequestMethod.GET, "/api/account/users/")
 
+# usernames the export can reference: bot/integration users have no email and
+# are never exported, so anything pointing at one would stay a raw username
+exportable_usernames = {
+    member["user"]["username"] for member in all_users if isinstance(member.get("user"), dict) and member["user"].get("email")
+}
+
 
 def process_user_extras(username, email):
     # forwarding rules: the list also contains rules forwarded TO this user,
@@ -507,6 +516,12 @@ def process_user_extras(username, email):
             continue
         if forwarding_rule_expired(rule):
             print(f"skipping expired forwarding rule {rule['unique_id']} of {username}")
+            continue
+        if rule.get("to_user") not in exportable_usernames:
+            print(
+                f"WARN: skipping forwarding rule {rule['unique_id']} of {username}: it forwards to"
+                f" {rule.get('to_user')}, a user the export does not create (bot or no email)"
+            )
             continue
         import_and_write(
             f"{username}_forwarding",
@@ -584,6 +599,9 @@ for member in all_users:
     if not isinstance(custom_role, dict) or not custom_role.get("unique_id"):
         continue
     member_username = member["user"]["username"]
+    if member_username not in exportable_usernames:
+        print(f"skipping custom role assignment of {member_username}: bot user, not exported")
+        continue
     import_and_write(
         member["user"].get("first_name", "") + member["user"].get("last_name", "") + "_role",
         "zenduty_assign_account_role",

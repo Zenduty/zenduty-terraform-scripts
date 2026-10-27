@@ -196,21 +196,22 @@ def api_delete(base_url, token, path):
         sys.exit(f"DELETE {path} failed {response.status_code}: {response.text[:500]}")
 
 
-def api_get_json(base_url, token, path):
-    # like api_get but returns the body as-is, for endpoints that are not lists
-    response = requests.get(base_url + path, headers={"Authorization": f"Token {token}"}, timeout=30)
+def api_request(method, base_url, token, path, payload=None):
+    """Non-fatal request: returns (json_or_None, error_or_None)."""
+    try:
+        response = requests.request(
+            method, base_url + path, json=payload, headers={"Authorization": f"Token {token}"}, timeout=30
+        )
+    except requests.RequestException as e:
+        return None, str(e)
     if not response.ok:
-        sys.exit(f"GET {path} failed {response.status_code}: {response.text[:500]}")
-    return response.json()
-
-
-def api_post(base_url, token, path, payload):
-    response = requests.post(
-        base_url + path, json=payload, headers={"Authorization": f"Token {token}"}, timeout=30
-    )
-    if not response.ok:
-        sys.exit(f"POST {path} failed {response.status_code}: {response.text[:500]}")
-    return response.json() if response.content else None
+        return None, f"{response.status_code}: {response.text[:200]}"
+    if not response.content:
+        return {}, None
+    try:
+        return response.json(), None
+    except ValueError:
+        return {}, None
 
 
 def exported_team_blocks(spec, state_addresses):
@@ -702,6 +703,10 @@ def fixup_user_names():
 
 _UUID_IN_TEXT = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 
+# keys whose values are node/edge ids in a workflow graph; those may be UUIDs
+# without referring to any object
+_WORKFLOW_GRAPH_ID_KEYS = ("id", "source", "target")
+
 
 def _unmapped_ids(value):
     # raw UUIDs left in a workflow action's inputs after findreplace.py:
@@ -718,27 +723,60 @@ def _unmapped_ids(value):
     return found
 
 
+def _unmapped_ids_in_schema_json(schema):
+    unmapped = []
+    nodes = schema.get("nodes") if isinstance(schema, dict) else None
+    for node in nodes or []:
+        data = node.get("data") if isinstance(node, dict) else None
+        if isinstance(data, dict):
+            unmapped.extend(_unmapped_ids(data.get("input")))
+    return unmapped
+
+
+def _unmapped_ids_in_schema_hcl(lines):
+    # jsonencode({...}) form, one attribute per line: skip the graph's own id
+    # attributes and `path` lists, anything else that is still a UUID is an
+    # unresolved reference
+    unmapped = []
+    skipping = 0
+    for line in lines:
+        if skipping > 0:
+            skipping += _bracket_balance(line)
+            continue
+        key_match = re.match(r'^\s*"?([A-Za-z0-9_]+)"?\s*=', line)
+        key = key_match.group(1) if key_match else None
+        if key in _WORKFLOW_GRAPH_ID_KEYS:
+            continue
+        if key == "path":
+            skipping = _bracket_balance(line)
+            continue
+        unmapped.extend(_UUID_IN_TEXT.findall(line))
+    return unmapped
+
+
 def fixup_workflows():
     # a workflow action pointing at an object the export could not map
     # (typically an outgoing integration the target does not have) keeps its
     # raw source UUID after findreplace.py; the backend would fail it on every
-    # run, so the workflow is applied disabled and listed for review. Only
-    # action inputs are inspected: node ids may legitimately be UUIDs.
+    # run, so the workflow is applied disabled and listed for review. Both
+    # spellings of json_schema are handled: the jsonencode({...}) object that
+    # generate-config emits and the quoted literal the JSON pin step writes.
+    # Only action inputs (or, in the HCL form, non-id attributes) are
+    # inspected: node ids may legitimately be UUIDs.
     def transform(name, block_lines):
         segments = split_segments(block_lines)
         attrs = _segment_attrs(segments)
-        literal = attrs.get("json_schema", "")
-        if not (literal.startswith('"') and literal.endswith('"')):
-            return block_lines  # jsonencode() form: nothing to inspect
-        try:
-            schema = json.loads(json.loads(literal))
-        except (ValueError, TypeError):
+        schema_lines = next((seg for kind, attr, seg in segments if kind == "attr" and attr == "json_schema"), None)
+        if schema_lines is None:
             return block_lines
-        unmapped = []
-        for node in (schema.get("nodes") or []) if isinstance(schema, dict) else []:
-            data = node.get("data") if isinstance(node, dict) else None
-            if isinstance(data, dict):
-                unmapped.extend(_unmapped_ids(data.get("input")))
+        literal = attrs.get("json_schema", "")
+        if literal.startswith('"') and literal.endswith('"'):
+            try:
+                unmapped = _unmapped_ids_in_schema_json(json.loads(json.loads(literal)))
+            except (ValueError, TypeError):
+                return block_lines
+        else:
+            unmapped = _unmapped_ids_in_schema_hcl(schema_lines)
         if not unmapped or attrs.get("is_enabled") == "false":
             return block_lines
         print(
@@ -763,7 +801,9 @@ def fixup_workflows():
 def copy_email_unsubscribes(base_url, token):
     # replay the per-user email unsubscribe preferences automate.py exported to
     # email_unsubscribes.json (keyed by email). The endpoint toggles, so only
-    # the types the target user is still subscribed to are sent.
+    # the types the target user is still subscribed to are sent. Runs after a
+    # successful apply, so one failing user must not abort the run: failures
+    # are collected and reported, and a re-run picks them up.
     path = out("email_unsubscribes.json")
     if not os.path.exists(path):
         return
@@ -771,27 +811,44 @@ def copy_email_unsubscribes(base_url, token):
         wanted = json.load(f)
     if not isinstance(wanted, dict) or not wanted:
         return
+    members, error = api_request("GET", base_url, token, "/api/account/users/")
+    if error:
+        print(f"WARN: email unsubscribes not replayed, could not list target users: {error}")
+        return
+    if isinstance(members, dict):
+        members = members.get("results") or []
     by_email = {}
-    for member in api_get(base_url, token, "/api/account/users/"):
+    for member in members or []:
         user = member.get("user") if isinstance(member, dict) else None
         if isinstance(user, dict) and user.get("email") and user.get("username"):
             by_email[user["email"].lower()] = user["username"]
     replayed = 0
     missing = []
+    failed = []
     for email, types in sorted(wanted.items()):
         username = by_email.get(email.lower())
         if not username:
             missing.append(email)
             continue
-        current = api_get_json(base_url, token, f"/api/notification/{username}/email-subscriptions/")
+        endpoint = f"/api/notification/{username}/email-subscriptions/"
+        current, error = api_request("GET", base_url, token, endpoint)
+        if error:
+            failed.append(f"{email} ({error})")
+            continue
         have = set(current.get("unsubscribed_emails") or []) if isinstance(current, dict) else set()
         todo = [t for t in types if t not in have]
-        if todo:
-            api_post(base_url, token, f"/api/notification/{username}/email-subscriptions/", {"email_types": todo})
-            replayed += 1
+        if not todo:
+            continue
+        _, error = api_request("POST", base_url, token, endpoint, {"email_types": todo})
+        if error:
+            failed.append(f"{email} ({error})")
+            continue
+        replayed += 1
     summary = f"email unsubscribes: replayed for {replayed} users"
     if missing:
         summary += f"; no target user for {len(missing)}: {', '.join(missing)}"
+    if failed:
+        summary += f"; failed for {len(failed)} (re-run apply.py to retry): {', '.join(failed)}"
     print(summary)
 
 
