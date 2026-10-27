@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import re
@@ -46,31 +47,7 @@ def direct_replace_ids(file_path: str, mapping_path: str) -> None:
         f.write(content)
 
 
-files = [
-    "zenduty_user.tf",
-    "zenduty_schedules.tf",
-    "zenduty_esp.tf",
-    "zenduty_priorities.tf",
-    "zenduty_tags.tf",
-    "zenduty_alertrules.tf",
-    "zenduty_integrations.tf",
-    "zenduty_services.tf",
-    "zenduty_sla.tf",
-    "zenduty_teams.tf",
-    "zenduty_roles.tf",
-    "zenduty_member.tf",
-    "zenduty_maintenance_window.tf",
-    "zenduty_post_incident_tasks.tf",
-    "zenduty_task_templates.tf",
-    "zenduty_task_template_tasks.tf",
-    "zenduty_team_permissions.tf",
-    "zenduty_outgoing_rules.tf",
-    "zenduty_notification_rules.tf",
-    "zenduty_usercontact.tf",
-    "zenduty_account_role.tf",
-    "zenduty_globalrouter.tf",
-    "zenduty_globalrouting_rule.tf",
-]
-
-for file in files:
-    direct_replace_ids(os.path.join(OUTPUT_DIR, file), os.path.join(OUTPUT_DIR, "mapping.json"))
+# every generated config file: hand-listing them meant each new resource type
+# silently kept its raw UUIDs until someone remembered to add it here
+for path in sorted(glob.glob(os.path.join(OUTPUT_DIR, "zenduty_*.tf"))):
+    direct_replace_ids(path, os.path.join(OUTPUT_DIR, "mapping.json"))

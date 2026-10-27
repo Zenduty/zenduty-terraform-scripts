@@ -196,6 +196,23 @@ def api_delete(base_url, token, path):
         sys.exit(f"DELETE {path} failed {response.status_code}: {response.text[:500]}")
 
 
+def api_get_json(base_url, token, path):
+    # like api_get but returns the body as-is, for endpoints that are not lists
+    response = requests.get(base_url + path, headers={"Authorization": f"Token {token}"}, timeout=30)
+    if not response.ok:
+        sys.exit(f"GET {path} failed {response.status_code}: {response.text[:500]}")
+    return response.json()
+
+
+def api_post(base_url, token, path, payload):
+    response = requests.post(
+        base_url + path, json=payload, headers={"Authorization": f"Token {token}"}, timeout=30
+    )
+    if not response.ok:
+        sys.exit(f"POST {path} failed {response.status_code}: {response.text[:500]}")
+    return response.json() if response.content else None
+
+
 def exported_team_blocks(spec, state_addresses):
     """Adoption candidates per team address, as `(address, is_default)` pairs.
 
@@ -683,12 +700,108 @@ def fixup_user_names():
     transform_resources(out("zenduty_user.tf"), "zenduty_user", transform)
 
 
+_UUID_IN_TEXT = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
+
+
+def _unmapped_ids(value):
+    # raw UUIDs left in a workflow action's inputs after findreplace.py:
+    # references the export could not resolve to a terraform resource
+    found = []
+    if isinstance(value, dict):
+        for item in value.values():
+            found.extend(_unmapped_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_unmapped_ids(item))
+    elif isinstance(value, str):
+        found.extend(_UUID_IN_TEXT.findall(value))
+    return found
+
+
+def fixup_workflows():
+    # a workflow action pointing at an object the export could not map
+    # (typically an outgoing integration the target does not have) keeps its
+    # raw source UUID after findreplace.py; the backend would fail it on every
+    # run, so the workflow is applied disabled and listed for review. Only
+    # action inputs are inspected: node ids may legitimately be UUIDs.
+    def transform(name, block_lines):
+        segments = split_segments(block_lines)
+        attrs = _segment_attrs(segments)
+        literal = attrs.get("json_schema", "")
+        if not (literal.startswith('"') and literal.endswith('"')):
+            return block_lines  # jsonencode() form: nothing to inspect
+        try:
+            schema = json.loads(json.loads(literal))
+        except (ValueError, TypeError):
+            return block_lines
+        unmapped = []
+        for node in (schema.get("nodes") or []) if isinstance(schema, dict) else []:
+            data = node.get("data") if isinstance(node, dict) else None
+            if isinstance(data, dict):
+                unmapped.extend(_unmapped_ids(data.get("input")))
+        if not unmapped or attrs.get("is_enabled") == "false":
+            return block_lines
+        print(
+            f"zenduty_workflow.{name}: action inputs reference ids unknown on the target"
+            f" ({', '.join(sorted(set(unmapped)))}); applying it disabled (is_enabled = false)"
+        )
+        result = []
+        replaced = False
+        for kind, attr, lines in segments:
+            if kind == "attr" and attr == "is_enabled":
+                result.append((kind, attr, ["  is_enabled = false"]))
+                replaced = True
+            else:
+                result.append((kind, attr, lines))
+        if not replaced:
+            result.insert(1, ("attr", "is_enabled", ["  is_enabled = false"]))
+        return join_segments(result)
+
+    transform_resources(out("zenduty_workflow.tf"), "zenduty_workflow", transform)
+
+
+def copy_email_unsubscribes(base_url, token):
+    # replay the per-user email unsubscribe preferences automate.py exported to
+    # email_unsubscribes.json (keyed by email). The endpoint toggles, so only
+    # the types the target user is still subscribed to are sent.
+    path = out("email_unsubscribes.json")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        wanted = json.load(f)
+    if not isinstance(wanted, dict) or not wanted:
+        return
+    by_email = {}
+    for member in api_get(base_url, token, "/api/account/users/"):
+        user = member.get("user") if isinstance(member, dict) else None
+        if isinstance(user, dict) and user.get("email") and user.get("username"):
+            by_email[user["email"].lower()] = user["username"]
+    replayed = 0
+    missing = []
+    for email, types in sorted(wanted.items()):
+        username = by_email.get(email.lower())
+        if not username:
+            missing.append(email)
+            continue
+        current = api_get_json(base_url, token, f"/api/notification/{username}/email-subscriptions/")
+        have = set(current.get("unsubscribed_emails") or []) if isinstance(current, dict) else set()
+        todo = [t for t in types if t not in have]
+        if todo:
+            api_post(base_url, token, f"/api/notification/{username}/email-subscriptions/", {"email_types": todo})
+            replayed += 1
+    summary = f"email unsubscribes: replayed for {replayed} users"
+    if missing:
+        summary += f"; no target user for {len(missing)}: {', '.join(missing)}"
+    print(summary)
+
+
 def run_compat_fixups():
     fixup_esp_untargeted_rules()
     fixup_alertrule_broken_actions()
     fixup_schedule_nonmember_users()
     fixup_services()
     fixup_user_names()
+    fixup_workflows()
 
 
 def main():
@@ -809,6 +922,7 @@ def main():
             os.remove(out(ADOPT_FILE))
     if code != 0:
         sys.exit("apply failed (output above); fix the reported errors and re-run apply.py")
+    copy_email_unsubscribes(base_url, token)
     print(f"done — target now managed by {os.path.abspath(OUTPUT_DIR)}/")
 
 

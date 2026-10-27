@@ -395,5 +395,125 @@ resource "zenduty_notification_rules" "owner" {
   # rules are unique on (contact, delay, urgency) and every contact gets
   # default rules with template delays (0, ...) at signup — use an oddball
   # delay so this never collides with them
-  delay    = 47
+  delay = 47
+}
+
+# ----------------------------------------------- account-level configuration
+# Resources added in provider 2.2.0.
+
+resource "zenduty_heartbeat" "main" {
+  service_id       = zenduty_services.main.id
+  name             = "${var.name_prefix}-heartbeat"
+  description      = "Smoke-test heartbeat"
+  interval_seconds = 3600
+  alert_message    = "Smoke-test heartbeat expired"
+  alert_urgency    = 0
+}
+
+# Singleton: pins one setting to its backend default so the smoke test never
+# flips account behaviour; destroy only forgets it.
+resource "zenduty_account_setting" "main" {
+  enable_regen_key = true
+}
+
+# No secrets on purpose: the API masks them on read, so an import round-trip
+# with secrets would (correctly) show them as missing from state.
+resource "zenduty_webhook_configuration" "main" {
+  url    = "https://example.com/${var.name_prefix}"
+  event  = ["incident_create", "incident_resolve"]
+  filter = jsonencode({ smoke = true })
+}
+
+resource "zenduty_account_stakeholder_template" "main" {
+  title    = "${var.name_prefix}-stakeholder"
+  subject  = "Smoke-test stakeholder update"
+  template = "Smoke-test body"
+}
+
+resource "zenduty_service_maintenance_window" "main" {
+  team_id    = zenduty_teams.a.id
+  service_id = zenduty_services.main.id
+  name       = "${var.name_prefix}-service-maintenance"
+  start_time = "2027-02-01 10:00"
+  end_time   = "2027-02-01 12:00"
+  timezone   = "Europe/Berlin"
+}
+
+resource "zenduty_maintenance_template" "main" {
+  team_id   = zenduty_teams.a.id
+  name      = "${var.name_prefix}-mt"
+  rule_json = local.alert_rule_json
+}
+
+resource "zenduty_service_context" "main" {
+  team_id     = zenduty_teams.a.id
+  service_id  = zenduty_services.main.id
+  integration = zenduty_integrations.main.id
+}
+
+resource "zenduty_incident_custom_field" "main" {
+  field_type = 3 # select
+  properties = jsonencode({
+    type  = "string"
+    title = "${var.name_prefix}-region"
+    enum  = ["eu", "us"]
+  })
+}
+
+# Deleting a type only deactivates it and the name stays reserved; the
+# per-run prefix keeps names fresh.
+resource "zenduty_incident_type" "main" {
+  name = "${var.name_prefix}-type"
+
+  form_toggles = {
+    impacted_services = true
+  }
+
+  custom_fields {
+    custom_field  = zenduty_incident_custom_field.main.id
+    required      = true
+    default_value = jsonencode("eu")
+  }
+}
+
+# Forwarding to oneself is accepted by the API and keeps the test
+# self-contained (the tester is the only user this config creates).
+resource "zenduty_user_forwarding_rule" "main" {
+  username  = zenduty_user.tester.id
+  to_user   = zenduty_user.tester.id
+  from_date = "2027-03-01 00:00"
+  to_date   = "2027-03-02 00:00"
+  time_zone = "UTC"
+}
+
+# Opt-in: the workflow endpoints accept session authentication only, so this
+# fails with an API key until the backend grants token access.
+resource "zenduty_workflow" "main" {
+  count       = var.enable_workflow ? 1 : 0
+  name        = "${var.name_prefix}-workflow"
+  description = "Smoke-test workflow"
+  is_draft    = false
+
+  json_schema = jsonencode({
+    nodes = [
+      {
+        id   = "trigger-1"
+        type = "trigger"
+        data = { name = "Incident Created", action_name = "incident_create", group = "Incident" }
+      },
+      {
+        id   = "action-1"
+        type = "action"
+        data = { name = "Add Note", action_name = "add_note", group = "Incident", input = { note = "smoke" } }
+      },
+    ]
+    edges = [
+      { id = "trigger-1->action-1", source = "trigger-1", target = "action-1" },
+    ]
+  })
+
+  teams {
+    team_id     = zenduty_teams.a.id
+    service_ids = [zenduty_services.main.id]
+  }
 }

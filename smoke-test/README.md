@@ -46,7 +46,7 @@ Or stage by stage: `build`, `validate`, `apply`, `plan-check`, `import`,
 | Stage | Proves |
 |---|---|
 | `validate` | every config block type-checks against the new provider schemas |
-| `apply` | all 24 resources create against the real API, incl. alert-rule `conditions`, SLA responders, `urgency = 0` incidents |
+| `apply` | all 35 resources create against the real API, incl. alert-rule `conditions`, SLA responders, `urgency = 0` incidents, and the resources added in provider 2.2.0 (heartbeat, account settings, webhook, stakeholder template, service maintenance window, maintenance template, service context, incident custom field + type, forwarding rule) |
 | `plan-check` | empty plan right after apply — no perpetual diffs anywhere |
 | `import` | every importer parses its documented ID, every Read rebuilds full state, plan stays empty afterwards |
 | `selfheal` | a resource deleted behind Terraform's back is re-planned, not an error (typed-404 path against real API error bodies) |
@@ -55,8 +55,17 @@ Or stage by stage: `build`, `validate`, `apply`, `plan-check`, `import`,
 
 ## Known limitations / by design
 
-- `zenduty_assign_account_role` has no importer, so it is absent from the
-  import round-trip.
+- `zenduty_workflow` is opt-in (`TF_VAR_enable_workflow=true`): the workflow
+  API accepts browser-session authentication only, so it fails with an API key
+  until the backend grants token access.
+- `zenduty_webhook_configuration` is created without secrets: the API masks
+  them on read, so a round-trip with secrets would (correctly) show them as
+  missing from state after the import.
+- `zenduty_incident_type` is only deactivated on destroy and its name stays
+  reserved; the per-run prefix keeps names fresh. Accounts allow 10 active
+  types and 20 custom fields.
+- `zenduty_account_setting` pins one setting to its default and is only
+  forgotten on destroy.
 - The alert rule uses a `value`-style action on purpose: typed action
   attributes (`escalation_policy = ...`) are diff-stable only while state
   remembers which spelling the config used, which a fresh import cannot.
