@@ -733,13 +733,55 @@ def _unmapped_ids_in_schema_json(schema):
     return unmapped
 
 
+def _nesting_balance(line):
+    # net ( [ { balance, ignoring brackets inside quoted strings
+    balance = 0
+    in_string = False
+    escaped = False
+    for ch in line:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch in "([{":
+                balance += 1
+            elif ch in ")]}":
+                balance -= 1
+    return balance
+
+
+def _attribute_lines(block_lines, name):
+    """Lines of a depth-1 attribute, including a multi-line jsonencode({...})
+    or object value. split_segments only follows square brackets, so a
+    jsonencode() object would be cut to its first line there."""
+    depth = 0
+    index = 0
+    while index < len(block_lines):
+        line = block_lines[index]
+        start_depth = depth
+        depth = _advance_depth(line, depth)
+        if start_depth == 1 and re.match(rf"^\s*{name}\s*=", line):
+            lines = [line]
+            balance = _nesting_balance(line)
+            while balance > 0 and index + 1 < len(block_lines):
+                index += 1
+                lines.append(block_lines[index])
+                balance += _nesting_balance(block_lines[index])
+            return lines
+        index += 1
+    return None
+
+
 def _unmapped_ids_in_schema_hcl(lines):
     # jsonencode({...}) form, one attribute per line: skip the graph's own id
     # attributes and `path` lists, anything else that is still a UUID is an
     # unresolved reference
     unmapped = []
     skipping = 0
-    for line in lines:
+    for line in lines[1:]:
         if skipping > 0:
             skipping += _bracket_balance(line)
             continue
@@ -766,10 +808,10 @@ def fixup_workflows():
     def transform(name, block_lines):
         segments = split_segments(block_lines)
         attrs = _segment_attrs(segments)
-        schema_lines = next((seg for kind, attr, seg in segments if kind == "attr" and attr == "json_schema"), None)
-        if schema_lines is None:
+        schema_lines = _attribute_lines(block_lines, "json_schema")
+        if not schema_lines:
             return block_lines
-        literal = attrs.get("json_schema", "")
+        literal = schema_lines[0].split("=", 1)[1].strip()
         if literal.startswith('"') and literal.endswith('"'):
             try:
                 unmapped = _unmapped_ids_in_schema_json(json.loads(json.loads(literal)))
