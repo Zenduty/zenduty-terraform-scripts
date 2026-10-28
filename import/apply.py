@@ -196,6 +196,24 @@ def api_delete(base_url, token, path):
         sys.exit(f"DELETE {path} failed {response.status_code}: {response.text[:500]}")
 
 
+def api_request(method, base_url, token, path, payload=None):
+    """Non-fatal request: returns (json_or_None, error_or_None)."""
+    try:
+        response = requests.request(
+            method, base_url + path, json=payload, headers={"Authorization": f"Token {token}"}, timeout=30
+        )
+    except requests.RequestException as e:
+        return None, str(e)
+    if not response.ok:
+        return None, f"{response.status_code}: {response.text[:200]}"
+    if not response.content:
+        return {}, None
+    try:
+        return response.json(), None
+    except ValueError:
+        return {}, None
+
+
 def exported_team_blocks(spec, state_addresses):
     """Adoption candidates per team address, as `(address, is_default)` pairs.
 
@@ -683,12 +701,206 @@ def fixup_user_names():
     transform_resources(out("zenduty_user.tf"), "zenduty_user", transform)
 
 
+_UUID_IN_TEXT = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
+
+# keys whose values are node/edge ids in a workflow graph; those may be UUIDs
+# without referring to any object
+_WORKFLOW_GRAPH_ID_KEYS = ("id", "source", "target")
+
+
+def _unmapped_ids(value):
+    # raw UUIDs left in a workflow action's inputs after findreplace.py:
+    # references the export could not resolve to a terraform resource
+    found = []
+    if isinstance(value, dict):
+        for item in value.values():
+            found.extend(_unmapped_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_unmapped_ids(item))
+    elif isinstance(value, str):
+        found.extend(_UUID_IN_TEXT.findall(value))
+    return found
+
+
+def _unmapped_ids_in_schema_json(schema):
+    unmapped = []
+    nodes = schema.get("nodes") if isinstance(schema, dict) else None
+    for node in nodes or []:
+        data = node.get("data") if isinstance(node, dict) else None
+        if isinstance(data, dict):
+            unmapped.extend(_unmapped_ids(data.get("input")))
+    return unmapped
+
+
+def _nesting_balance(line):
+    # net ( [ { balance, ignoring brackets inside quoted strings
+    balance = 0
+    in_string = False
+    escaped = False
+    for ch in line:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch in "([{":
+                balance += 1
+            elif ch in ")]}":
+                balance -= 1
+    return balance
+
+
+def _attribute_lines(block_lines, name):
+    """Lines of a depth-1 attribute, including a multi-line jsonencode({...})
+    or object value. split_segments only follows square brackets, so a
+    jsonencode() object would be cut to its first line there."""
+    depth = 0
+    index = 0
+    while index < len(block_lines):
+        line = block_lines[index]
+        start_depth = depth
+        depth = _advance_depth(line, depth)
+        if start_depth == 1 and re.match(rf"^\s*{name}\s*=", line):
+            lines = [line]
+            balance = _nesting_balance(line)
+            while balance > 0 and index + 1 < len(block_lines):
+                index += 1
+                lines.append(block_lines[index])
+                balance += _nesting_balance(block_lines[index])
+            return lines
+        index += 1
+    return None
+
+
+def _unmapped_ids_in_schema_hcl(lines):
+    # jsonencode({...}) form, one attribute per line: skip the graph's own id
+    # attributes and `path` lists, anything else that is still a UUID is an
+    # unresolved reference
+    unmapped = []
+    skipping = 0
+    for line in lines[1:]:
+        if skipping > 0:
+            skipping += _bracket_balance(line)
+            continue
+        key_match = re.match(r'^\s*"?([A-Za-z0-9_]+)"?\s*=', line)
+        key = key_match.group(1) if key_match else None
+        if key in _WORKFLOW_GRAPH_ID_KEYS:
+            continue
+        if key == "path":
+            skipping = _bracket_balance(line)
+            continue
+        unmapped.extend(_UUID_IN_TEXT.findall(line))
+    return unmapped
+
+
+def fixup_workflows():
+    # a workflow action pointing at an object the export could not map
+    # (typically an outgoing integration the target does not have) keeps its
+    # raw source UUID after findreplace.py; the backend would fail it on every
+    # run, so the workflow is applied disabled and listed for review. Both
+    # spellings of json_schema are handled: the jsonencode({...}) object that
+    # generate-config emits and the quoted literal the JSON pin step writes.
+    # Only action inputs (or, in the HCL form, non-id attributes) are
+    # inspected: node ids may legitimately be UUIDs.
+    def transform(name, block_lines):
+        segments = split_segments(block_lines)
+        attrs = _segment_attrs(segments)
+        schema_lines = _attribute_lines(block_lines, "json_schema")
+        if not schema_lines:
+            return block_lines
+        literal = schema_lines[0].split("=", 1)[1].strip()
+        if literal.startswith('"') and literal.endswith('"'):
+            try:
+                unmapped = _unmapped_ids_in_schema_json(json.loads(json.loads(literal)))
+            except (ValueError, TypeError):
+                return block_lines
+        else:
+            unmapped = _unmapped_ids_in_schema_hcl(schema_lines)
+        if not unmapped or attrs.get("is_enabled") == "false":
+            return block_lines
+        print(
+            f"zenduty_workflow.{name}: action inputs reference ids unknown on the target"
+            f" ({', '.join(sorted(set(unmapped)))}); applying it disabled (is_enabled = false)"
+        )
+        result = []
+        replaced = False
+        for kind, attr, lines in segments:
+            if kind == "attr" and attr == "is_enabled":
+                result.append((kind, attr, ["  is_enabled = false"]))
+                replaced = True
+            else:
+                result.append((kind, attr, lines))
+        if not replaced:
+            result.insert(1, ("attr", "is_enabled", ["  is_enabled = false"]))
+        return join_segments(result)
+
+    transform_resources(out("zenduty_workflow.tf"), "zenduty_workflow", transform)
+
+
+def copy_email_unsubscribes(base_url, token):
+    # replay the per-user email unsubscribe preferences automate.py exported to
+    # email_unsubscribes.json (keyed by email). The endpoint toggles, so only
+    # the types the target user is still subscribed to are sent. Runs after a
+    # successful apply, so one failing user must not abort the run: failures
+    # are collected and reported, and a re-run picks them up.
+    path = out("email_unsubscribes.json")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        wanted = json.load(f)
+    if not isinstance(wanted, dict) or not wanted:
+        return
+    members, error = api_request("GET", base_url, token, "/api/account/users/")
+    if error:
+        print(f"WARN: email unsubscribes not replayed, could not list target users: {error}")
+        return
+    if isinstance(members, dict):
+        members = members.get("results") or []
+    by_email = {}
+    for member in members or []:
+        user = member.get("user") if isinstance(member, dict) else None
+        if isinstance(user, dict) and user.get("email") and user.get("username"):
+            by_email[user["email"].lower()] = user["username"]
+    replayed = 0
+    missing = []
+    failed = []
+    for email, types in sorted(wanted.items()):
+        username = by_email.get(email.lower())
+        if not username:
+            missing.append(email)
+            continue
+        endpoint = f"/api/notification/{username}/email-subscriptions/"
+        current, error = api_request("GET", base_url, token, endpoint)
+        if error:
+            failed.append(f"{email} ({error})")
+            continue
+        have = set(current.get("unsubscribed_emails") or []) if isinstance(current, dict) else set()
+        todo = [t for t in types if t not in have]
+        if not todo:
+            continue
+        _, error = api_request("POST", base_url, token, endpoint, {"email_types": todo})
+        if error:
+            failed.append(f"{email} ({error})")
+            continue
+        replayed += 1
+    summary = f"email unsubscribes: replayed for {replayed} users"
+    if missing:
+        summary += f"; no target user for {len(missing)}: {', '.join(missing)}"
+    if failed:
+        summary += f"; failed for {len(failed)} (re-run apply.py to retry): {', '.join(failed)}"
+    print(summary)
+
+
 def run_compat_fixups():
     fixup_esp_untargeted_rules()
     fixup_alertrule_broken_actions()
     fixup_schedule_nonmember_users()
     fixup_services()
     fixup_user_names()
+    fixup_workflows()
 
 
 def main():
@@ -787,7 +999,9 @@ def main():
                 "# target to their exported counterparts; removed automatically after the apply\n"
             )
             for address, import_id in imports:
-                f.write(f'import {{\n  to = {address}\n  id = "{import_id}"\n}}\n')
+                # provider named explicitly for the same reason as in automate.py
+                # (terraform 1.16.0-1.16.2, hashicorp/terraform#39144)
+                f.write(f'import {{\n  provider = zenduty\n  to = {address}\n  id = "{import_id}"\n}}\n')
         print(f"phase 2: adopting {len(imports)} auto-created defaults, then applying everything else")
     else:
         print("phase 2: nothing to adopt, applying everything else")
@@ -807,6 +1021,7 @@ def main():
             os.remove(out(ADOPT_FILE))
     if code != 0:
         sys.exit("apply failed (output above); fix the reported errors and re-run apply.py")
+    copy_email_unsubscribes(base_url, token)
     print(f"done — target now managed by {os.path.abspath(OUTPUT_DIR)}/")
 
 

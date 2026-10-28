@@ -12,6 +12,7 @@ import uuid
 import subprocess
 import re
 import json
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
@@ -376,6 +377,41 @@ def creatable_alert_actions(actions):
     return creatable
 
 
+def _parse_api_time(value):
+    # API timestamps are ISO 8601, UTC with a Z suffix (or an explicit offset)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # a naive timestamp cannot be compared with an aware "now"; the API sends
+    # UTC, so treat it as such
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def maintenance_window_ended(window):
+    # a window that can never be active again cannot be created on the target
+    # in a meaningful way (and the create API may reject past times)
+    now = datetime.now(timezone.utc)
+    repeat_until = _parse_api_time(window.get("repeat_until"))
+    end_time = _parse_api_time(window.get("end_time"))
+    if window.get("repeat_interval"):
+        return repeat_until is not None and repeat_until < now
+    return end_time is not None and end_time < now
+
+
+def forwarding_rule_expired(rule):
+    to_date = _parse_api_time(rule.get("to_date"))
+    return to_date is not None and to_date < datetime.now(timezone.utc)
+
+
+# email unsubscribe preferences are not a terraform resource; they are
+# exported to email_unsubscribes.json (keyed by email) and apply.py replays
+# them on the target after the apply
+email_unsubscribes = {}
+
+
 def safe_get(endpoint, raw=False):
     # Some endpoints 404/403 depending on the account plan; skip them instead of aborting the run
     try:
@@ -465,6 +501,46 @@ if default_team is None:
 
 all_users = client.execute(ZendutyClientRequestMethod.GET, "/api/account/users/")
 
+# usernames the export can reference: bot/integration users have no email and
+# are never exported, so anything pointing at one would stay a raw username
+exportable_usernames = {
+    member["user"]["username"] for member in all_users if isinstance(member.get("user"), dict) and member["user"].get("email")
+}
+
+
+def process_user_extras(username, email):
+    # forwarding rules: the list also contains rules forwarded TO this user,
+    # which belong to (and are exported with) the forwarding user
+    for rule in safe_get(f"/api/account/users/{username}/forwarding_rules/"):
+        if rule.get("user") != username:
+            continue
+        if forwarding_rule_expired(rule):
+            print(f"skipping expired forwarding rule {rule['unique_id']} of {username}")
+            continue
+        if rule.get("to_user") not in exportable_usernames:
+            print(
+                f"WARN: skipping forwarding rule {rule['unique_id']} of {username}: it forwards to"
+                f" {rule.get('to_user')}, a user the export does not create (bot or no email)"
+            )
+            continue
+        import_and_write(
+            f"{username}_forwarding",
+            "zenduty_user_forwarding_rule",
+            f"{username}/{rule['unique_id']}",
+            rule["unique_id"],
+        )
+
+    if email:
+        subscriptions = safe_get(f"/api/notification/{username}/email-subscriptions/", raw=True)
+        types = [
+            item.get("email_type") if isinstance(item, dict) else item
+            for item in (subscriptions.get("unsubscribed_emails") or [])
+        ]
+        types = [t for t in types if t]
+        if types:
+            with state_lock:
+                email_unsubscribes[email] = sorted(set(types))
+
 
 def process_user(user):
     username = user["user"]["username"]
@@ -481,6 +557,7 @@ def process_user(user):
                     "zenduty_user.tf", f'data "zenduty_user" "{name}" {{\n    email = "{owner_email}"\n}}\n'
                 )
                 add_mapping(username, f"data.zenduty_user.{name}.users[0].username")
+        process_user_extras(username, owner_email)
         return
 
     # bot/integration users have no email; the provider cannot create or manage them
@@ -495,6 +572,7 @@ def process_user(user):
         username,
         extra_lines=[f'    team       = "{default_team}"'] if default_team else None,
     )
+    process_user_extras(username, user["user"].get("email"))
 
     # notification rules are deliberately not migrated: they are personal
     # per-user preferences tied to contact methods (phone/email UUIDs) that
@@ -511,6 +589,93 @@ for account_role in safe_get("/api/account/customroles/"):
         "zenduty_account_role",
         account_role["unique_id"],
         account_role["unique_id"],
+    )
+
+# custom role assignments come from the member rows fetched above; the import
+# id is the username and the mapping key is prefixed so it does not collide
+# with the user's own entry
+for member in all_users:
+    custom_role = member.get("custom_role_id")
+    if not isinstance(custom_role, dict) or not custom_role.get("unique_id"):
+        continue
+    member_username = member["user"]["username"]
+    if member_username not in exportable_usernames:
+        print(f"skipping custom role assignment of {member_username}: bot user, not exported")
+        continue
+    import_and_write(
+        member["user"].get("first_name", "") + member["user"].get("last_name", "") + "_role",
+        "zenduty_assign_account_role",
+        member_username,
+        f"custom-role-{member_username}",
+    )
+
+# the settings object is a singleton: fixed import id, and a sentinel mapping
+# key so re-runs recognise it
+import_and_write("account", "zenduty_account_setting", "account", "account-setting")
+
+for heartbeat in safe_get("/api/account/heartbeats/"):
+    import_and_write(
+        heartbeat["name"],
+        "zenduty_heartbeat",
+        heartbeat["unique_id"],
+        heartbeat["unique_id"],
+        extra_skip=("team_id", "ping_url", "ping_email", "status"),
+    )
+
+for webhook in safe_get("/api/v2/account/webhookconfiguration/"):
+    # the API masks auth_secret_key and api_key on read, so the exported
+    # config cannot carry them; they must be re-entered on the target
+    if webhook.get("auth_secret_key") or webhook.get("api_key"):
+        print(
+            f"WARN: webhook configuration {webhook['url']} ({webhook['unique_id']}) has a secret"
+            " the API does not return; add auth_secret_key/api_key to its"
+            " zenduty_webhook_configuration block before applying to the target"
+        )
+    import_and_write(
+        webhook["url"],
+        "zenduty_webhook_configuration",
+        webhook["unique_id"],
+        webhook["unique_id"],
+        extra_skip=("auth_secret_key", "api_key"),
+    )
+
+for template in safe_get("/api/account/account-stakeholder-template/"):
+    import_and_write(
+        template["title"],
+        "zenduty_account_stakeholder_template",
+        template["unique_id"],
+        template["unique_id"],
+    )
+
+# custom field definitions before the incident types that map them, so the
+# mapping has the field ids when the type config is rewritten
+for field in safe_get("/api/incidents/custom_fields/"):
+    properties = field.get("properties") if isinstance(field.get("properties"), dict) else {}
+    import_and_write(
+        properties.get("title") or field.get("field_key") or field["unique_id"],
+        "zenduty_incident_custom_field",
+        field["unique_id"],
+        field["unique_id"],
+        extra_skip=("field_key",),
+    )
+
+for incident_type in safe_get("/api/incidents/incident_types/"):
+    import_and_write(
+        incident_type["name"],
+        "zenduty_incident_type",
+        incident_type["unique_id"],
+        incident_type["unique_id"],
+    )
+
+# workflows: the endpoint currently accepts session authentication only, so
+# with an API key safe_get warns and skips; the loop starts working as soon
+# as the backend grants token access
+for workflow in safe_get("/api/workflows/"):
+    import_and_write(
+        workflow["name"],
+        "zenduty_workflow",
+        workflow["unique_id"],
+        workflow["unique_id"],
     )
 
 
@@ -682,7 +847,52 @@ def process_team(team):
                         outgoing_rule["unique_id"],
                     )
 
+        # content-based collation policies only exist (and only apply) on
+        # services with collation 3; the provider refuses them otherwise
+        if getattr(service, "collation", None) == 3:
+            for policy in safe_get(
+                f"/api/account/teams/{team.unique_id}/services/{service.unique_id}/alert-grouping-policies/"
+            ):
+                import_and_write(
+                    f"{service.name}_grouping",
+                    "zenduty_alert_grouping_policy",
+                    f"{team.unique_id}/{service.unique_id}/{policy['unique_id']}",
+                    policy["unique_id"],
+                )
+
+        for window in safe_get(f"/api/account/teams/{team.unique_id}/services/{service.unique_id}/maintenance/"):
+            if maintenance_window_ended(window):
+                print(f"skipping ended service maintenance window '{window['name']}' ({window['unique_id']})")
+                continue
+            import_and_write(
+                window["name"],
+                "zenduty_service_maintenance_window",
+                f"{team.unique_id}/{service.unique_id}/{window['unique_id']}",
+                window["unique_id"],
+            )
+
+        for context in safe_get(
+            f"/api/account/teams/{team.unique_id}/services/{service.unique_id}/context_integrations/"
+        ):
+            import_and_write(
+                f"{service.name}_context",
+                "zenduty_service_context",
+                f"{team.unique_id}/{service.unique_id}/{context['unique_id']}",
+                context["unique_id"],
+            )
+
+    for template in safe_get(f"/api/v2/account/teams/{team.unique_id}/maintenance_template/"):
+        import_and_write(
+            template["name"],
+            "zenduty_maintenance_template",
+            f"{team.unique_id}/{template['unique_id']}",
+            template["unique_id"],
+        )
+
     for window in safe_get(f"/api/account/teams/{team.unique_id}/maintenance/"):
+        if maintenance_window_ended(window):
+            print(f"skipping ended maintenance window '{window['name']}' ({window['unique_id']})")
+            continue
         import_and_write(
             window["name"],
             "zenduty_maintenance_window",
@@ -851,10 +1061,17 @@ def _postprocess_block(lines, entry):
 
 
 def _write_import_blocks(entries):
+    # `provider = zenduty` is spelled out because terraform 1.16.0-1.16.2 stop
+    # consulting required_providers for import targets that have no config yet
+    # and fall back to hashicorp/zenduty, which does not exist
+    # (hashicorp/terraform#39144). The argument is accepted since 1.5.0.
     with open(out("imports.tf"), "w", encoding="utf-8") as f:
         f.write("# generated by automate.py --fast; removed automatically after a successful import\n")
         for entry in entries:
-            f.write(f'import {{\n  to = {entry["resource"]}.{entry["name"]}\n  id = "{entry["import_id"]}"\n}}\n')
+            f.write(
+                f'import {{\n  provider = zenduty\n  to = {entry["resource"]}.{entry["name"]}\n'
+                f'  id = "{entry["import_id"]}"\n}}\n'
+            )
 
 
 def _plan_counts(output):
@@ -1211,5 +1428,10 @@ if FAST_MODE:
 # behind duplicates the last imported resource and breaks `terraform plan`
 if os.path.exists(out("temp1.tf")):
     os.remove(out("temp1.tf"))
+
+if email_unsubscribes:
+    with open(out("email_unsubscribes.json"), "w", encoding="utf-8") as f:
+        json.dump(email_unsubscribes, f, indent=4, sort_keys=True)
+    print(f"exported email unsubscribe preferences of {len(email_unsubscribes)} users to email_unsubscribes.json")
 
 print(f"Done. Terraform config, state and mapping.json written to {os.path.abspath(OUTPUT_DIR)}/")
