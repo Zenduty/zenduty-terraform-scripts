@@ -76,9 +76,42 @@ if FAST_MODE and os.path.exists(out("imports.tf")):
     )
 
 subprocess.run("terraform init", shell=True, cwd=OUTPUT_DIR)
+
+
+def _check_provider_version():
+    # main.tf is only copied into a new folder and `terraform init` keeps to
+    # an existing lock file, so a folder from an older exporter stays on the
+    # provider it started with. Resource types that provider lacks would fail
+    # the import only after the whole enumeration, so stop here instead. A
+    # provider from another source address (a local dev build) is not checked.
+    def parse(version):
+        return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+
+    with open(os.path.join(SCRIPT_DIR, "main.tf"), encoding="utf-8") as f:
+        required = re.search(r'version\s*=\s*">=\s*([\d.]+)"', f.read())
+    run = subprocess.run(["terraform", "version", "-json"], capture_output=True, text=True, cwd=OUTPUT_DIR)
+    try:
+        selected = json.loads(run.stdout)["provider_selections"].get("registry.terraform.io/zenduty/zenduty")
+    except Exception:
+        return
+    if required and selected and parse(selected) < parse(required.group(1)):
+        sys.exit(
+            f"{OUTPUT_DIR}/ is locked to zenduty provider {selected}, but this exporter needs >="
+            f" {required.group(1)}. Start a fresh export folder, or raise the version in"
+            f" {out('main.tf')} and run `terraform init -upgrade` there."
+        )
+
+
+_check_provider_version()
 # export ZENDUTY_API_KEY
 cred = ZendutyCredential()
 client = ZendutyClient(credential=cred, use_https=True)
+# ZENDUTY_BASE_URL (migrate.sh's "Source URL") points the provider at another
+# instance, and the enumeration has to read that same instance. The SDK
+# constructor only takes a dotted hostname (no scheme, no port), so the URL
+# is set on the client directly.
+if os.environ.get("ZENDUTY_BASE_URL"):
+    client._url = os.environ["ZENDUTY_BASE_URL"].rstrip("/")
 
 
 class AdaptiveThrottle:
@@ -412,6 +445,16 @@ def forwarding_rule_expired(rule):
 email_unsubscribes = {}
 
 
+def api_list(endpoint):
+    # the SDK's typed models accept a fixed set of fields and raise on any
+    # other, so a field the API adds later (schedules gained
+    # restriction_version) crashed the export. The team loops only need names
+    # and ids, so they read the raw objects. Unlike safe_get, a failed request
+    # aborts the run: these are core objects, and skipping them would leave a
+    # silently partial export.
+    return client.execute(ZendutyClientRequestMethod.GET, endpoint, success_code=200) or []
+
+
 def safe_get(endpoint, raw=False):
     # Some endpoints 404/403 depending on the account plan; skip them instead of aborting the run
     try:
@@ -602,6 +645,16 @@ for member in all_users:
     if member_username not in exportable_usernames:
         print(f"skipping custom role assignment of {member_username}: bot user, not exported")
         continue
+    # the API reads and assigns a custom role for plain users (role 3) only.
+    # A member promoted to admin or owner keeps the old assignment row, but
+    # its read is refused (which fails the whole import plan) and it could
+    # never be created on the target
+    if str(member.get("role")) != "3":
+        print(
+            f"WARN: skipping custom role assignment of {member_username}: account role"
+            f" {member.get('role')} cannot hold a custom role"
+        )
+        continue
     import_and_write(
         member["user"].get("first_name", "") + member["user"].get("last_name", "") + "_role",
         "zenduty_assign_account_role",
@@ -610,8 +663,9 @@ for member in all_users:
     )
 
 # the settings object is a singleton: fixed import id, and a sentinel mapping
-# key so re-runs recognise it
-import_and_write("account", "zenduty_account_setting", "account", "account-setting")
+# key so re-runs recognise it. findreplace.py substitutes every mapping key it
+# finds in the config, so the sentinel must be text no exported value contains
+import_and_write("account", "zenduty_account_setting", "account", "__zenduty_account_setting__")
 
 for heartbeat in safe_get("/api/account/heartbeats/"):
     import_and_write(
@@ -669,13 +723,15 @@ for incident_type in safe_get("/api/incidents/incident_types/"):
 
 # workflows: the endpoint currently accepts session authentication only, so
 # with an API key safe_get warns and skips; the loop starts working as soon
-# as the backend grants token access
+# as the backend grants token access. line_assert: the graph in json_schema
+# has `id` and `position` keys the per-resource flow must not strip
 for workflow in safe_get("/api/workflows/"):
     import_and_write(
         workflow["name"],
         "zenduty_workflow",
         workflow["unique_id"],
         workflow["unique_id"],
+        line_assert=True,
     )
 
 
@@ -713,64 +769,62 @@ def process_team(team):
             ["    depends_on = ["] + [f"        {ref}," for ref in member_refs] + ["    ]"]
         )
 
-    for schedule in teams_client.get_schedule_client(team).get_all_schedules():
+    for schedule in api_list(f"/api/account/teams/{team.unique_id}/schedules/"):
         import_and_write(
-            schedule.name,
+            schedule["name"],
             "zenduty_schedules",
-            f"{team.unique_id}/{schedule.unique_id}",
-            schedule.unique_id,
+            f"{team.unique_id}/{schedule['unique_id']}",
+            schedule["unique_id"],
             extra_lines=member_depends,
         )
 
-    for escalation in teams_client.get_escalation_policy_client(team).get_all_policies():
+    for escalation in api_list(f"/api/account/teams/{team.unique_id}/escalation_policies/"):
         # the create API refuses EPs with no rules — and treats rules without
         # targets the same way — so an exported one could never be applied to
         # a fresh account; skip it (and anything that references it will
         # surface the dangling id at plan time). EPs that keep at least one
         # targeted rule are exported as-is; apply.py strips their remaining
         # target-less rules before applying.
-        rules = getattr(escalation, "rules", None) or []
-        if not any(
-            (rule.get("targets") if isinstance(rule, dict) else getattr(rule, "targets", None))
-            for rule in rules
-        ):
+        if not any(rule.get("targets") for rule in escalation.get("rules") or []):
             print(
-                f"WARN: skipping escalation policy '{escalation.name}' ({escalation.unique_id}):"
+                f"WARN: skipping escalation policy '{escalation['name']}' ({escalation['unique_id']}):"
                 " it has no rules with targets, which the create API rejects; add a"
                 " targeted rule in the source account to include it"
             )
             continue
         import_and_write(
-            escalation.name,
+            escalation["name"],
             "zenduty_esp",
-            f"{team.unique_id}/{escalation.unique_id}",
-            escalation.unique_id,
+            f"{team.unique_id}/{escalation['unique_id']}",
+            escalation["unique_id"],
             extra_lines=member_depends,
         )
 
-    for sla in teams_client.get_sla_client(team).get_all_slas():
+    for sla in api_list(f"/api/account/teams/{team.unique_id}/sla/"):
         import_and_write(
-            sla.name,
+            sla["name"],
             "zenduty_sla",
-            f"{team.unique_id}/{sla.unique_id}",
-            sla.unique_id,
+            f"{team.unique_id}/{sla['unique_id']}",
+            sla["unique_id"],
             extra_lines=member_depends,
         )
 
-    for incident_role in teams_client.get_incident_role_client(team).get_all_roles():
+    for incident_role in api_list(f"/api/account/teams/{team.unique_id}/roles/"):
         import_and_write(
-            incident_role.title,
+            incident_role["title"],
             "zenduty_roles",
-            f"{team.unique_id}/{incident_role.unique_id}",
-            incident_role.unique_id,
+            f"{team.unique_id}/{incident_role['unique_id']}",
+            incident_role["unique_id"],
         )
 
-    for team_tag in teams_client.get_tag_client(team).get_all_tags():
-        import_and_write(team_tag.name, "zenduty_tags", f"{team.unique_id}/{team_tag.unique_id}", team_tag.unique_id)
-
-    for priority in teams_client.get_priority_client(team).get_all_priorities():
+    for team_tag in api_list(f"/api/account/teams/{team.unique_id}/tags/"):
         import_and_write(
-            priority.name, "zenduty_priorities", f"{team.unique_id}/{priority.unique_id}", priority.unique_id
+            team_tag["name"], "zenduty_tags", f"{team.unique_id}/{team_tag['unique_id']}", team_tag["unique_id"]
+        )
+
+    for priority in api_list(f"/api/account/teams/{team.unique_id}/priority/"):
+        import_and_write(
+            priority["name"], "zenduty_priorities", f"{team.unique_id}/{priority['unique_id']}", priority["unique_id"]
         )
 
     services_client = teams_client.get_service_client(team)
@@ -882,11 +936,14 @@ def process_team(team):
             )
 
     for template in safe_get(f"/api/v2/account/teams/{team.unique_id}/maintenance_template/"):
+        # line_assert: the rule tree in rule_json has `id` keys of its own,
+        # which the per-resource flow must not strip
         import_and_write(
             template["name"],
             "zenduty_maintenance_template",
             f"{team.unique_id}/{template['unique_id']}",
             template["unique_id"],
+            line_assert=True,
         )
 
     for window in safe_get(f"/api/account/teams/{team.unique_id}/maintenance/"):
@@ -1060,16 +1117,20 @@ def _postprocess_block(lines, entry):
     return result
 
 
-def _write_import_blocks(entries):
+def _write_import_blocks(entries, name_provider=True):
     # `provider = zenduty` is spelled out because terraform 1.16.0-1.16.2 stop
     # consulting required_providers for import targets that have no config yet
     # and fall back to hashicorp/zenduty, which does not exist
-    # (hashicorp/terraform#39144). The argument is accepted since 1.5.0.
+    # (hashicorp/terraform#39144). The argument is accepted since 1.5.0, but
+    # only while the target has no config: once the generated blocks are
+    # written terraform rejects it, so the verification plan gets the same
+    # import blocks without it (name_provider=False).
+    provider_line = "  provider = zenduty\n" if name_provider else ""
     with open(out("imports.tf"), "w", encoding="utf-8") as f:
         f.write("# generated by automate.py --fast; removed automatically after a successful import\n")
         for entry in entries:
             f.write(
-                f'import {{\n  provider = zenduty\n  to = {entry["resource"]}.{entry["name"]}\n'
+                f'import {{\n{provider_line}  to = {entry["resource"]}.{entry["name"]}\n'
                 f'  id = "{entry["import_id"]}"\n}}\n'
             )
 
@@ -1359,6 +1420,8 @@ def run_fast_import():
             f.write("\n".join(lines) + "\n")
         written += 1
     os.remove(out(generated_name))
+    # the targets have config from here on
+    _write_import_blocks(entries, name_provider=False)
 
     # data-source blocks (applications, contacts, owner) join the config now so
     # the verification plan exercises them too
@@ -1433,5 +1496,11 @@ if email_unsubscribes:
     with open(out("email_unsubscribes.json"), "w", encoding="utf-8") as f:
         json.dump(email_unsubscribes, f, indent=4, sort_keys=True)
     print(f"exported email unsubscribe preferences of {len(email_unsubscribes)} users to email_unsubscribes.json")
+elif os.path.exists(out("email_unsubscribes.json")):
+    # every run reads the preferences of all users, so a file from an earlier
+    # run is stale once nobody is unsubscribed any more; apply.py would
+    # otherwise unsubscribe those users on the target
+    os.remove(out("email_unsubscribes.json"))
+    print("no user is unsubscribed from emails any more; removed the earlier email_unsubscribes.json")
 
 print(f"Done. Terraform config, state and mapping.json written to {os.path.abspath(OUTPUT_DIR)}/")

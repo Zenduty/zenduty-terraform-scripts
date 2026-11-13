@@ -999,9 +999,10 @@ def main():
                 "# target to their exported counterparts; removed automatically after the apply\n"
             )
             for address, import_id in imports:
-                # provider named explicitly for the same reason as in automate.py
-                # (terraform 1.16.0-1.16.2, hashicorp/terraform#39144)
-                f.write(f'import {{\n  provider = zenduty\n  to = {address}\n  id = "{import_id}"\n}}\n')
+                # no `provider` argument, unlike automate.py's generate step:
+                # every target here already has config, and terraform rejects
+                # the argument on such import blocks
+                f.write(f'import {{\n  to = {address}\n  id = "{import_id}"\n}}\n')
         print(f"phase 2: adopting {len(imports)} auto-created defaults, then applying everything else")
     else:
         print("phase 2: nothing to adopt, applying everything else")

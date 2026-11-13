@@ -48,6 +48,7 @@ def direct_replace_ids(file_path: str, mapping_path: str) -> None:
 
 
 # every generated config file: hand-listing them meant each new resource type
-# silently kept its raw UUIDs until someone remembered to add it here
-for path in sorted(glob.glob(os.path.join(OUTPUT_DIR, "zenduty_*.tf"))):
+# silently kept its raw UUIDs until someone remembered to add it here. The
+# folder name is escaped: one with glob characters (acme[eu]) matched nothing
+for path in sorted(glob.glob(os.path.join(glob.escape(OUTPUT_DIR), "zenduty_*.tf"))):
     direct_replace_ids(path, os.path.join(OUTPUT_DIR, "mapping.json"))
