@@ -135,15 +135,23 @@ same one.
 
 ### What gets imported
 
-All 21 importable resource types: users, teams, team members, schedules,
+All 34 importable resource types: users, teams, team members, schedules,
 escalation policies, SLAs, incident roles, tags, priorities, services,
-integrations, alert rules, outgoing rules, maintenance windows, post-incident
-tasks, task templates (+ tasks), team permissions,
-account custom roles, global routers, and global routing rules.
+integrations, alert rules, outgoing rules, alert grouping policies, team and
+service maintenance windows, maintenance templates, service context
+integrations, post-incident tasks, task templates (+ tasks), team
+permissions, account custom roles and their assignments, global routers,
+global routing rules, heartbeats, the account settings singleton, account
+webhook configurations, account stakeholder templates, incident custom
+fields, incident types, user forwarding rules and (see below) workflows.
+
+Also exported, outside Terraform: each user's email unsubscribe preferences
+go to `email_unsubscribes.json` (keyed by email) and are replayed on the
+target by `apply.py` after the apply.
 
 Not imported:
 
-- `zenduty_invite`, `zenduty_assign_account_role` — the provider has no importer for these.
+- `zenduty_invite` — the provider has no importer for it.
 - `zenduty_incidents` — importable but deliberately skipped; incidents are runtime data, not configuration.
 - User notification rules — deliberately skipped; they are personal per-user
   preferences tied to contact-method UUIDs that only exist once the user
@@ -153,15 +161,27 @@ Not imported:
 - Bot users (no email) — the provider cannot manage them.
 - The account owner (role 1) is not imported as a resource; a `data "zenduty_user"`
   block is generated instead so other resources can reference the owner.
+- Maintenance windows that have ended and forwarding rules that have expired —
+  they can never be active again and the create APIs may reject past times.
+- Workflows, for now: `/api/workflows/` accepts browser-session
+  authentication only, so with an API key the export logs a `WARN` and skips
+  them. The `zenduty_workflow` loop starts working as soon as the backend
+  grants token access to that endpoint.
+
+Exported with a gap:
+
+- `zenduty_webhook_configuration` — the API masks `auth_secret_key` and
+  `api_key` on read, so they are stripped from the export (a `WARN` names each
+  webhook that has one). Add them to the block before applying to the target.
 
 The Zenduty invite API always requires a destination team, so every imported user
 gets a deterministic `team`: a team named `GLOBAL` (override with
 `ZENDUTY_INVITE_TEAM`), created automatically on the first run if missing.
 
-Provider requirement: the generated config needs registry release **2.0.0 or
-newer** — it uses the `zenduty_applications` data source and relies on
-optional schedule layer/override names and whitespace-tolerant user last
-names, none of which exist in 1.0.6. `import/main.tf` points at the registry
+Provider requirement: the generated config needs registry release **2.2.0 or
+newer** — it uses the resources added in 2.2.0 (heartbeats,
+account settings, webhooks, incident types, …) and the `zenduty_applications`
+data source, none of which exist in 1.0.6 or 2.0.0. `import/main.tf` points at the registry
 provider (`zenduty/zenduty`), and `terraform init` picks up the latest
 release. To test an unreleased provider build instead, install it with
 `smoke-test/scripts/run.sh` (or `go build` into

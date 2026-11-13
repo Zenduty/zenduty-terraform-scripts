@@ -12,6 +12,7 @@ import uuid
 import subprocess
 import re
 import json
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
@@ -75,9 +76,42 @@ if FAST_MODE and os.path.exists(out("imports.tf")):
     )
 
 subprocess.run("terraform init", shell=True, cwd=OUTPUT_DIR)
+
+
+def _check_provider_version():
+    # main.tf is only copied into a new folder and `terraform init` keeps to
+    # an existing lock file, so a folder from an older exporter stays on the
+    # provider it started with. Resource types that provider lacks would fail
+    # the import only after the whole enumeration, so stop here instead. A
+    # provider from another source address (a local dev build) is not checked.
+    def parse(version):
+        return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+
+    with open(os.path.join(SCRIPT_DIR, "main.tf"), encoding="utf-8") as f:
+        required = re.search(r'version\s*=\s*">=\s*([\d.]+)"', f.read())
+    run = subprocess.run(["terraform", "version", "-json"], capture_output=True, text=True, cwd=OUTPUT_DIR)
+    try:
+        selected = json.loads(run.stdout)["provider_selections"].get("registry.terraform.io/zenduty/zenduty")
+    except Exception:
+        return
+    if required and selected and parse(selected) < parse(required.group(1)):
+        sys.exit(
+            f"{OUTPUT_DIR}/ is locked to zenduty provider {selected}, but this exporter needs >="
+            f" {required.group(1)}. Start a fresh export folder, or raise the version in"
+            f" {out('main.tf')} and run `terraform init -upgrade` there."
+        )
+
+
+_check_provider_version()
 # export ZENDUTY_API_KEY
 cred = ZendutyCredential()
 client = ZendutyClient(credential=cred, use_https=True)
+# ZENDUTY_BASE_URL (migrate.sh's "Source URL") points the provider at another
+# instance, and the enumeration has to read that same instance. The SDK
+# constructor only takes a dotted hostname (no scheme, no port), so the URL
+# is set on the client directly.
+if os.environ.get("ZENDUTY_BASE_URL"):
+    client._url = os.environ["ZENDUTY_BASE_URL"].rstrip("/")
 
 
 class AdaptiveThrottle:
@@ -376,6 +410,51 @@ def creatable_alert_actions(actions):
     return creatable
 
 
+def _parse_api_time(value):
+    # API timestamps are ISO 8601, UTC with a Z suffix (or an explicit offset)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # a naive timestamp cannot be compared with an aware "now"; the API sends
+    # UTC, so treat it as such
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def maintenance_window_ended(window):
+    # a window that can never be active again cannot be created on the target
+    # in a meaningful way (and the create API may reject past times)
+    now = datetime.now(timezone.utc)
+    repeat_until = _parse_api_time(window.get("repeat_until"))
+    end_time = _parse_api_time(window.get("end_time"))
+    if window.get("repeat_interval"):
+        return repeat_until is not None and repeat_until < now
+    return end_time is not None and end_time < now
+
+
+def forwarding_rule_expired(rule):
+    to_date = _parse_api_time(rule.get("to_date"))
+    return to_date is not None and to_date < datetime.now(timezone.utc)
+
+
+# email unsubscribe preferences are not a terraform resource; they are
+# exported to email_unsubscribes.json (keyed by email) and apply.py replays
+# them on the target after the apply
+email_unsubscribes = {}
+
+
+def api_list(endpoint):
+    # the SDK's typed models accept a fixed set of fields and raise on any
+    # other, so a field the API adds later (schedules gained
+    # restriction_version) crashed the export. The team loops only need names
+    # and ids, so they read the raw objects. Unlike safe_get, a failed request
+    # aborts the run: these are core objects, and skipping them would leave a
+    # silently partial export.
+    return client.execute(ZendutyClientRequestMethod.GET, endpoint, success_code=200) or []
+
+
 def safe_get(endpoint, raw=False):
     # Some endpoints 404/403 depending on the account plan; skip them instead of aborting the run
     try:
@@ -465,6 +544,46 @@ if default_team is None:
 
 all_users = client.execute(ZendutyClientRequestMethod.GET, "/api/account/users/")
 
+# usernames the export can reference: bot/integration users have no email and
+# are never exported, so anything pointing at one would stay a raw username
+exportable_usernames = {
+    member["user"]["username"] for member in all_users if isinstance(member.get("user"), dict) and member["user"].get("email")
+}
+
+
+def process_user_extras(username, email):
+    # forwarding rules: the list also contains rules forwarded TO this user,
+    # which belong to (and are exported with) the forwarding user
+    for rule in safe_get(f"/api/account/users/{username}/forwarding_rules/"):
+        if rule.get("user") != username:
+            continue
+        if forwarding_rule_expired(rule):
+            print(f"skipping expired forwarding rule {rule['unique_id']} of {username}")
+            continue
+        if rule.get("to_user") not in exportable_usernames:
+            print(
+                f"WARN: skipping forwarding rule {rule['unique_id']} of {username}: it forwards to"
+                f" {rule.get('to_user')}, a user the export does not create (bot or no email)"
+            )
+            continue
+        import_and_write(
+            f"{username}_forwarding",
+            "zenduty_user_forwarding_rule",
+            f"{username}/{rule['unique_id']}",
+            rule["unique_id"],
+        )
+
+    if email:
+        subscriptions = safe_get(f"/api/notification/{username}/email-subscriptions/", raw=True)
+        types = [
+            item.get("email_type") if isinstance(item, dict) else item
+            for item in (subscriptions.get("unsubscribed_emails") or [])
+        ]
+        types = [t for t in types if t]
+        if types:
+            with state_lock:
+                email_unsubscribes[email] = sorted(set(types))
+
 
 def process_user(user):
     username = user["user"]["username"]
@@ -481,6 +600,7 @@ def process_user(user):
                     "zenduty_user.tf", f'data "zenduty_user" "{name}" {{\n    email = "{owner_email}"\n}}\n'
                 )
                 add_mapping(username, f"data.zenduty_user.{name}.users[0].username")
+        process_user_extras(username, owner_email)
         return
 
     # bot/integration users have no email; the provider cannot create or manage them
@@ -495,6 +615,7 @@ def process_user(user):
         username,
         extra_lines=[f'    team       = "{default_team}"'] if default_team else None,
     )
+    process_user_extras(username, user["user"].get("email"))
 
     # notification rules are deliberately not migrated: they are personal
     # per-user preferences tied to contact methods (phone/email UUIDs) that
@@ -511,6 +632,106 @@ for account_role in safe_get("/api/account/customroles/"):
         "zenduty_account_role",
         account_role["unique_id"],
         account_role["unique_id"],
+    )
+
+# custom role assignments come from the member rows fetched above; the import
+# id is the username and the mapping key is prefixed so it does not collide
+# with the user's own entry
+for member in all_users:
+    custom_role = member.get("custom_role_id")
+    if not isinstance(custom_role, dict) or not custom_role.get("unique_id"):
+        continue
+    member_username = member["user"]["username"]
+    if member_username not in exportable_usernames:
+        print(f"skipping custom role assignment of {member_username}: bot user, not exported")
+        continue
+    # the API reads and assigns a custom role for plain users (role 3) only.
+    # A member promoted to admin or owner keeps the old assignment row, but
+    # its read is refused (which fails the whole import plan) and it could
+    # never be created on the target
+    if str(member.get("role")) != "3":
+        print(
+            f"WARN: skipping custom role assignment of {member_username}: account role"
+            f" {member.get('role')} cannot hold a custom role"
+        )
+        continue
+    import_and_write(
+        member["user"].get("first_name", "") + member["user"].get("last_name", "") + "_role",
+        "zenduty_assign_account_role",
+        member_username,
+        f"custom-role-{member_username}",
+    )
+
+# the settings object is a singleton: fixed import id, and a sentinel mapping
+# key so re-runs recognise it. findreplace.py substitutes every mapping key it
+# finds in the config, so the sentinel must be text no exported value contains
+import_and_write("account", "zenduty_account_setting", "account", "__zenduty_account_setting__")
+
+for heartbeat in safe_get("/api/account/heartbeats/"):
+    import_and_write(
+        heartbeat["name"],
+        "zenduty_heartbeat",
+        heartbeat["unique_id"],
+        heartbeat["unique_id"],
+        extra_skip=("team_id", "ping_url", "ping_email", "status"),
+    )
+
+for webhook in safe_get("/api/v2/account/webhookconfiguration/"):
+    # the API masks auth_secret_key and api_key on read, so the exported
+    # config cannot carry them; they must be re-entered on the target
+    if webhook.get("auth_secret_key") or webhook.get("api_key"):
+        print(
+            f"WARN: webhook configuration {webhook['url']} ({webhook['unique_id']}) has a secret"
+            " the API does not return; add auth_secret_key/api_key to its"
+            " zenduty_webhook_configuration block before applying to the target"
+        )
+    import_and_write(
+        webhook["url"],
+        "zenduty_webhook_configuration",
+        webhook["unique_id"],
+        webhook["unique_id"],
+        extra_skip=("auth_secret_key", "api_key"),
+    )
+
+for template in safe_get("/api/account/account-stakeholder-template/"):
+    import_and_write(
+        template["title"],
+        "zenduty_account_stakeholder_template",
+        template["unique_id"],
+        template["unique_id"],
+    )
+
+# custom field definitions before the incident types that map them, so the
+# mapping has the field ids when the type config is rewritten
+for field in safe_get("/api/incidents/custom_fields/"):
+    properties = field.get("properties") if isinstance(field.get("properties"), dict) else {}
+    import_and_write(
+        properties.get("title") or field.get("field_key") or field["unique_id"],
+        "zenduty_incident_custom_field",
+        field["unique_id"],
+        field["unique_id"],
+        extra_skip=("field_key",),
+    )
+
+for incident_type in safe_get("/api/incidents/incident_types/"):
+    import_and_write(
+        incident_type["name"],
+        "zenduty_incident_type",
+        incident_type["unique_id"],
+        incident_type["unique_id"],
+    )
+
+# workflows: the endpoint currently accepts session authentication only, so
+# with an API key safe_get warns and skips; the loop starts working as soon
+# as the backend grants token access. line_assert: the graph in json_schema
+# has `id` and `position` keys the per-resource flow must not strip
+for workflow in safe_get("/api/workflows/"):
+    import_and_write(
+        workflow["name"],
+        "zenduty_workflow",
+        workflow["unique_id"],
+        workflow["unique_id"],
+        line_assert=True,
     )
 
 
@@ -548,64 +769,62 @@ def process_team(team):
             ["    depends_on = ["] + [f"        {ref}," for ref in member_refs] + ["    ]"]
         )
 
-    for schedule in teams_client.get_schedule_client(team).get_all_schedules():
+    for schedule in api_list(f"/api/account/teams/{team.unique_id}/schedules/"):
         import_and_write(
-            schedule.name,
+            schedule["name"],
             "zenduty_schedules",
-            f"{team.unique_id}/{schedule.unique_id}",
-            schedule.unique_id,
+            f"{team.unique_id}/{schedule['unique_id']}",
+            schedule["unique_id"],
             extra_lines=member_depends,
         )
 
-    for escalation in teams_client.get_escalation_policy_client(team).get_all_policies():
+    for escalation in api_list(f"/api/account/teams/{team.unique_id}/escalation_policies/"):
         # the create API refuses EPs with no rules — and treats rules without
         # targets the same way — so an exported one could never be applied to
         # a fresh account; skip it (and anything that references it will
         # surface the dangling id at plan time). EPs that keep at least one
         # targeted rule are exported as-is; apply.py strips their remaining
         # target-less rules before applying.
-        rules = getattr(escalation, "rules", None) or []
-        if not any(
-            (rule.get("targets") if isinstance(rule, dict) else getattr(rule, "targets", None))
-            for rule in rules
-        ):
+        if not any(rule.get("targets") for rule in escalation.get("rules") or []):
             print(
-                f"WARN: skipping escalation policy '{escalation.name}' ({escalation.unique_id}):"
+                f"WARN: skipping escalation policy '{escalation['name']}' ({escalation['unique_id']}):"
                 " it has no rules with targets, which the create API rejects; add a"
                 " targeted rule in the source account to include it"
             )
             continue
         import_and_write(
-            escalation.name,
+            escalation["name"],
             "zenduty_esp",
-            f"{team.unique_id}/{escalation.unique_id}",
-            escalation.unique_id,
+            f"{team.unique_id}/{escalation['unique_id']}",
+            escalation["unique_id"],
             extra_lines=member_depends,
         )
 
-    for sla in teams_client.get_sla_client(team).get_all_slas():
+    for sla in api_list(f"/api/account/teams/{team.unique_id}/sla/"):
         import_and_write(
-            sla.name,
+            sla["name"],
             "zenduty_sla",
-            f"{team.unique_id}/{sla.unique_id}",
-            sla.unique_id,
+            f"{team.unique_id}/{sla['unique_id']}",
+            sla["unique_id"],
             extra_lines=member_depends,
         )
 
-    for incident_role in teams_client.get_incident_role_client(team).get_all_roles():
+    for incident_role in api_list(f"/api/account/teams/{team.unique_id}/roles/"):
         import_and_write(
-            incident_role.title,
+            incident_role["title"],
             "zenduty_roles",
-            f"{team.unique_id}/{incident_role.unique_id}",
-            incident_role.unique_id,
+            f"{team.unique_id}/{incident_role['unique_id']}",
+            incident_role["unique_id"],
         )
 
-    for team_tag in teams_client.get_tag_client(team).get_all_tags():
-        import_and_write(team_tag.name, "zenduty_tags", f"{team.unique_id}/{team_tag.unique_id}", team_tag.unique_id)
-
-    for priority in teams_client.get_priority_client(team).get_all_priorities():
+    for team_tag in api_list(f"/api/account/teams/{team.unique_id}/tags/"):
         import_and_write(
-            priority.name, "zenduty_priorities", f"{team.unique_id}/{priority.unique_id}", priority.unique_id
+            team_tag["name"], "zenduty_tags", f"{team.unique_id}/{team_tag['unique_id']}", team_tag["unique_id"]
+        )
+
+    for priority in api_list(f"/api/account/teams/{team.unique_id}/priority/"):
+        import_and_write(
+            priority["name"], "zenduty_priorities", f"{team.unique_id}/{priority['unique_id']}", priority["unique_id"]
         )
 
     services_client = teams_client.get_service_client(team)
@@ -682,7 +901,55 @@ def process_team(team):
                         outgoing_rule["unique_id"],
                     )
 
+        # content-based collation policies only exist (and only apply) on
+        # services with collation 3; the provider refuses them otherwise
+        if getattr(service, "collation", None) == 3:
+            for policy in safe_get(
+                f"/api/account/teams/{team.unique_id}/services/{service.unique_id}/alert-grouping-policies/"
+            ):
+                import_and_write(
+                    f"{service.name}_grouping",
+                    "zenduty_alert_grouping_policy",
+                    f"{team.unique_id}/{service.unique_id}/{policy['unique_id']}",
+                    policy["unique_id"],
+                )
+
+        for window in safe_get(f"/api/account/teams/{team.unique_id}/services/{service.unique_id}/maintenance/"):
+            if maintenance_window_ended(window):
+                print(f"skipping ended service maintenance window '{window['name']}' ({window['unique_id']})")
+                continue
+            import_and_write(
+                window["name"],
+                "zenduty_service_maintenance_window",
+                f"{team.unique_id}/{service.unique_id}/{window['unique_id']}",
+                window["unique_id"],
+            )
+
+        for context in safe_get(
+            f"/api/account/teams/{team.unique_id}/services/{service.unique_id}/context_integrations/"
+        ):
+            import_and_write(
+                f"{service.name}_context",
+                "zenduty_service_context",
+                f"{team.unique_id}/{service.unique_id}/{context['unique_id']}",
+                context["unique_id"],
+            )
+
+    for template in safe_get(f"/api/v2/account/teams/{team.unique_id}/maintenance_template/"):
+        # line_assert: the rule tree in rule_json has `id` keys of its own,
+        # which the per-resource flow must not strip
+        import_and_write(
+            template["name"],
+            "zenduty_maintenance_template",
+            f"{team.unique_id}/{template['unique_id']}",
+            template["unique_id"],
+            line_assert=True,
+        )
+
     for window in safe_get(f"/api/account/teams/{team.unique_id}/maintenance/"):
+        if maintenance_window_ended(window):
+            print(f"skipping ended maintenance window '{window['name']}' ({window['unique_id']})")
+            continue
         import_and_write(
             window["name"],
             "zenduty_maintenance_window",
@@ -850,11 +1117,22 @@ def _postprocess_block(lines, entry):
     return result
 
 
-def _write_import_blocks(entries):
+def _write_import_blocks(entries, name_provider=True):
+    # `provider = zenduty` is spelled out because terraform 1.16.0-1.16.2 stop
+    # consulting required_providers for import targets that have no config yet
+    # and fall back to hashicorp/zenduty, which does not exist
+    # (hashicorp/terraform#39144). The argument is accepted since 1.5.0, but
+    # only while the target has no config: once the generated blocks are
+    # written terraform rejects it, so the verification plan gets the same
+    # import blocks without it (name_provider=False).
+    provider_line = "  provider = zenduty\n" if name_provider else ""
     with open(out("imports.tf"), "w", encoding="utf-8") as f:
         f.write("# generated by automate.py --fast; removed automatically after a successful import\n")
         for entry in entries:
-            f.write(f'import {{\n  to = {entry["resource"]}.{entry["name"]}\n  id = "{entry["import_id"]}"\n}}\n')
+            f.write(
+                f'import {{\n{provider_line}  to = {entry["resource"]}.{entry["name"]}\n'
+                f'  id = "{entry["import_id"]}"\n}}\n'
+            )
 
 
 def _plan_counts(output):
@@ -1142,6 +1420,8 @@ def run_fast_import():
             f.write("\n".join(lines) + "\n")
         written += 1
     os.remove(out(generated_name))
+    # the targets have config from here on
+    _write_import_blocks(entries, name_provider=False)
 
     # data-source blocks (applications, contacts, owner) join the config now so
     # the verification plan exercises them too
@@ -1211,5 +1491,16 @@ if FAST_MODE:
 # behind duplicates the last imported resource and breaks `terraform plan`
 if os.path.exists(out("temp1.tf")):
     os.remove(out("temp1.tf"))
+
+if email_unsubscribes:
+    with open(out("email_unsubscribes.json"), "w", encoding="utf-8") as f:
+        json.dump(email_unsubscribes, f, indent=4, sort_keys=True)
+    print(f"exported email unsubscribe preferences of {len(email_unsubscribes)} users to email_unsubscribes.json")
+elif os.path.exists(out("email_unsubscribes.json")):
+    # every run reads the preferences of all users, so a file from an earlier
+    # run is stale once nobody is unsubscribed any more; apply.py would
+    # otherwise unsubscribe those users on the target
+    os.remove(out("email_unsubscribes.json"))
+    print("no user is unsubscribed from emails any more; removed the earlier email_unsubscribes.json")
 
 print(f"Done. Terraform config, state and mapping.json written to {os.path.abspath(OUTPUT_DIR)}/")

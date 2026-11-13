@@ -125,11 +125,24 @@ Attach the newest log of the failing phase from
   after each user completes signup on the target; users get the default set
   when their invite is created.
 - **Bot/integration users** (no email) — cannot be created via the API.
+- **Webhook secrets** — the API never returns a webhook's signing secret or
+  API key, so `zenduty_webhook_configuration` blocks arrive without them; the
+  export prints a `WARN` for each affected webhook. Get the secrets from the
+  customer and add them to the block before step 2 (or re-enter them in the
+  target UI afterwards).
+- **Workflows** — the workflow API accepts browser-session authentication
+  only, so the export skips them with a `WARN` until the backend grants API
+  key access. Recreate them in the target UI for now.
+- **Ended maintenance windows and expired forwarding rules** — skipped on
+  purpose; they could never be active again.
 - **The account owner** is referenced, not created — the target account's own
   owner takes that place.
 - Every migrated user is invited via a team named `GLOBAL` (created
   automatically; the invite API requires one). Users appear fully once they
   accept the invite on the target.
+- Email unsubscribe preferences **do** migrate: step 1 writes them to
+  `email_unsubscribes.json` and step 2 replays them per user (matched by
+  email) after the apply.
 
 ## Notes
 

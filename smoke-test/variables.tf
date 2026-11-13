@@ -30,3 +30,9 @@ variable "notification_username" {
   default     = ""
   description = "Optional: username of an EXISTING user with contact methods (e.g. the account owner) to exercise zenduty_notification_rules + the usercontact data source. Freshly invited users have no contacts, so this cannot use the tester user."
 }
+
+variable "enable_workflow" {
+  type        = bool
+  default     = false
+  description = "Create a zenduty_workflow. Off by default: the workflow API currently accepts session authentication only, so it fails with an API key until the backend grants token access."
+}

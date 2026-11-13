@@ -123,3 +123,62 @@ data "zenduty_notification_rules" "owner" {
   username   = var.notification_username
   depends_on = [zenduty_notification_rules.owner]
 }
+
+# ---- data sources added in provider 2.2.0
+
+data "zenduty_heartbeats" "main" {
+  service_id = zenduty_services.main.id
+  depends_on = [zenduty_heartbeat.main]
+}
+
+data "zenduty_account_setting" "main" {
+  depends_on = [zenduty_account_setting.main]
+}
+
+data "zenduty_webhook_configurations" "main" {
+  depends_on = [zenduty_webhook_configuration.main]
+}
+
+data "zenduty_account_stakeholder_templates" "main" {
+  depends_on = [zenduty_account_stakeholder_template.main]
+}
+
+data "zenduty_service_maintenance_windows" "main" {
+  team_id    = zenduty_teams.a.id
+  service_id = zenduty_services.main.id
+  depends_on = [zenduty_service_maintenance_window.main]
+}
+
+data "zenduty_maintenance_templates" "main" {
+  team_id    = zenduty_teams.a.id
+  depends_on = [zenduty_maintenance_template.main]
+}
+
+data "zenduty_service_contexts" "main" {
+  team_id    = zenduty_teams.a.id
+  service_id = zenduty_services.main.id
+  depends_on = [zenduty_service_context.main]
+}
+
+data "zenduty_incident_custom_fields" "main" {
+  depends_on = [zenduty_incident_custom_field.main]
+}
+
+data "zenduty_incident_types" "main" {
+  depends_on = [zenduty_incident_type.main]
+}
+
+data "zenduty_user_forwarding_rules" "tester" {
+  username   = zenduty_user.tester.id
+  depends_on = [zenduty_user_forwarding_rule.main]
+}
+
+data "zenduty_user_custom_role" "tester" {
+  username   = zenduty_user.tester.id
+  depends_on = [zenduty_assign_account_role.main]
+}
+
+data "zenduty_workflows" "main" {
+  count      = var.enable_workflow ? 1 : 0
+  depends_on = [zenduty_workflow.main]
+}

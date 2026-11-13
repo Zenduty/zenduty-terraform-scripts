@@ -69,8 +69,11 @@ fetch_application_id() {
   # handle both a bare list and a paginated {results: []}; prefer the generic
   # API application, fall back to the first entry
   if [ -z "${TF_VAR_application_id:-}" ]; then
+    # skip inactive catalog entries: the API rejects them with "This
+    # application is not available" (a local catalog ships the API app inactive)
     TF_VAR_application_id=$(printf '%s' "$apps" | jq -r '
       (if type == "object" then .results else . end)
+      | map(select((.is_active // 1) != 0 and (.application_type // 0) == 0))
       | (map(select((.name // "") | ascii_downcase == "api")) + .)[0].unique_id')
     [ -n "$TF_VAR_application_id" ] && [ "$TF_VAR_application_id" != "null" ] \
       || fail "could not determine an application id; set TF_VAR_application_id"
@@ -82,7 +85,7 @@ fetch_application_id() {
   if [ -z "${TF_VAR_outgoing_application_id:-}" ]; then
     TF_VAR_outgoing_application_id=$(printf '%s' "$apps" | jq -r '
       (if type == "object" then .results else . end)
-      | map(select(.application_type == 1))
+      | map(select(.application_type == 1 and (.is_active // 1) != 0))
       | (map(select((.name // "") | ascii_downcase | contains("webhook"))) + .)[0].unique_id')
     [ -n "$TF_VAR_outgoing_application_id" ] && [ "$TF_VAR_outgoing_application_id" != "null" ] \
       || fail "no outbound application (application_type == 1) in the catalog; set TF_VAR_outgoing_application_id"
